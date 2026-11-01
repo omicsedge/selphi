@@ -42,7 +42,7 @@ fn memtrace(label: &str) {
         crate::selphi_info!("  [memtrace] {:<40} {:.1} GB RSS", label, rss_gb());
     }
 }
-use super::pl_reader::{parse_pl_vcf, BlockSites, PlVcfResult, RefBlocks};
+use super::pl_reader::{parse_pl_vcf, BlockSites, PlVcfResult, RefBlocks, NO_CALL};
 use super::LcwgsParams;
 use super::memory::{SampleExecution, WaveReclaimer};
 
@@ -91,7 +91,7 @@ pub fn run_lcwgs(
         !srp.ids[0].contains(first_ref)
     };
     let keep = BlockSites { contig: srp.chromosome(), positions: srp.variants.positions() };
-    let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid, blocks } =
+    let PlVcfResult { gl3: gl3_input, markers, sample_ids, haploid_samples: pl_haploid, blocks, calls } =
         parse_pl_vcf(target_vcf, hash_alleles, Some(&keep))?;
     // A single sample's records were parsed on many workers.
     if sample_ids.len() == 1 { crate::common::mem::release_freed_memory(); }
@@ -157,9 +157,37 @@ pub fn run_lcwgs(
     drop(gl3_input);
     drop(blocks);
     memtrace("after gl3_shared relayout (gl3_input dropped)");
+    // A GT:GQ file's sure calls, in the same order (none at a padded site).
+    let calls_shared: Option<Vec<u8>> = (!calls.is_empty()).then(|| target_idx.iter().flat_map(|&t| {
+        let row = (t != usize::MAX).then(|| &calls[t * n_samples..(t + 1) * n_samples]);
+        (0..n_samples).map(move |smp| row.map_or(NO_CALL, |r| r[smp]))
+    }).collect());
+    drop(calls);
 
     // --- 5. cM map + chunked Gibbs imputation (shared with the BAM path) ---
-    impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None, None, None)
+    let mut out = impute_from_gl3(srp, &wgs_idx, gl3_shared, n_samples, sample_ids, &pl_haploid, map_path, params, None, None, None)?;
+    if let Some(c) = calls_shared {
+        let n = keep_typed_calls(&mut out, &c);
+        selphi_info!("  {} typed call(s) with GQ at or above the kept threshold written as called", n);
+    }
+    Ok(out)
+}
+
+/// A GT:GQ file's sure calls (`calls[v * n_samples + s]`, the ALT count or [`NO_CALL`]) written as
+/// called, as the genotype engine writes them: this engine cannot place an allele no conditioning
+/// haplotype carries, whatever its likelihood, so a sure rare heterozygote came out hom-ref (HG002
+/// chr22 at 11.16x: 22 of 398 true heterozygotes under 0.5% panel MAF called with GQ >= 50).
+fn keep_typed_calls(out: &mut LcwgsOutput, calls: &[u8]) -> usize {
+    let mut n = 0;
+    for (i, &c) in calls.iter().enumerate() {
+        if c == NO_CALL { continue; }
+        out.dosage[i] = f32::from(c);
+        let mut gp = [0.0f32; 3];
+        gp[usize::from(c)] = 1.0;
+        out.gp[3 * i..3 * i + 3].copy_from_slice(&gp);
+        n += 1;
+    }
+    n
 }
 
 /// A run's read-pair linkage (BAM/CRAM input, see [`super::linkage`]): its settings
@@ -2029,6 +2057,15 @@ fn run_chunked_gibbs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_calls_overwrite_their_rows_only() {
+        let mut out = LcwgsOutput { dosage: vec![0.2, 1.4, 0.9], gp: vec![0.8, 0.2, 0.0, 0.1, 0.4, 0.5, 0.2, 0.7, 0.1],
+            n_variants: 3, sample_ids: vec!["S".into()], panel_idx: vec![0, 1, 2] };
+        assert_eq!(keep_typed_calls(&mut out, &[1, NO_CALL, 2]), 2);
+        assert_eq!(out.dosage, vec![1.0, 1.4, 2.0]);
+        assert_eq!(out.gp, vec![0.0, 1.0, 0.0, 0.1, 0.4, 0.5, 0.0, 0.0, 1.0]);
+    }
 
     #[test]
     fn deep_pass_depth() {

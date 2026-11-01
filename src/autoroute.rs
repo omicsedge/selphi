@@ -83,6 +83,9 @@ struct Sniff {
     /// variant calls, not its blocks, are confident.
     pl_var_n: u64,
     pl_var_sure: u64,
+    /// The header declares GT and GQ but neither PL nor GL (`pl_reader::gq_only_format`): the
+    /// likelihood engine reads such a file's calls as the likelihoods they stand for.
+    gq_header: bool,
 }
 
 /// Phred gap between the best and second-best genotype of a settled call.
@@ -127,6 +130,12 @@ fn wgs_density_threshold() -> f64 {
         .unwrap_or(1000.0)
 }
 
+/// Whether a GT:GQ callset at WGS density goes to the likelihood engine (`SELPHI_AUTOROUTE_GQ`,
+/// default on; 0 = genotype + refine, as before).
+fn gq_likelihoods() -> bool {
+    selphi::config::raw("SELPHI_AUTOROUTE_GQ").is_none_or(|v| v.trim() != "0")
+}
+
 /// Cap (bytes) on how much of a VCF-TEXT target the sniff decompresses into
 /// memory. Auto-route is default-ON, so the sniff runs on every imputation run;
 /// without a cap a pathologically large `.vcf.gz` would be fully decompressed
@@ -150,7 +159,9 @@ fn sniff_max_bytes() -> u64 {
 /// 3. No PL and no GT → `Lcwgs`. A GT-only file stays on the genotype engine at
 ///    any call rate: the lcWGS engine reads only PL, so it would discard every
 ///    call (a cohort merged from different arrays has a low call rate).
-/// 4. No PL, confident GT: GQ/DP present AND WGS-scale density → `RefineGenotype`;
+/// 4. No PL, GT and GQ (declared without PL or GL) at WGS-scale density → `Lcwgs`, on likelihoods
+///    rebuilt from the calls (`SELPHI_AUTOROUTE_GQ=0`: as 5).
+/// 5. No PL, confident GT: GQ/DP present AND WGS-scale density → `RefineGenotype`;
 ///    otherwise (chip array, or GT-only) → `PlainGenotype`.
 fn auto_route_decision(is_reads: bool, s: &Sniff, wgs_density_thr: f64) -> AutoRoute {
     // 1. Aligned reads are unambiguously the lcWGS regime.
@@ -176,7 +187,16 @@ fn auto_route_decision(is_reads: bool, s: &Sniff, wgs_density_thr: f64) -> AutoR
     if !s.has_gt {
         return AutoRoute::Lcwgs;
     }
-    // 4. Confident hard calls WITHOUT PL (a GT:GQ/DP callset with PL stripped,
+    // 4. GT and GQ without PL at WGS density (a callset written without its likelihoods): the
+    //    likelihood engine, on the likelihoods each call stands for (`pl_reader::gq_pl`). HG002 chr22
+    //    at 4.46x / 11.16x / 33.5x, per-sample R² 0.9695 / 0.9964 / 0.9982 against 0.9476 / 0.9864 /
+    //    0.9976 for genotype + refine; HG003-HG007 chr20 at ~4.8x / ~12x / ~36x, +0.021 / +0.012 / +0.0009
+    //    on average, every sample and MAF bin at or above refine. A chip array carrying GQ stays below the density gate; a gVCF or
+    //    all-sites file (not measured) and, in `resolve`, a sparse file stay with refine.
+    if s.gq_header && s.has_gq && s.ref_blocks == 0 && s.density_per_mb() >= wgs_density_thr && gq_likelihoods() {
+        return AutoRoute::Lcwgs;
+    }
+    // 5. Confident hard calls WITHOUT PL (a GT:GQ/DP callset with PL stripped,
     //    or a chip array). --refine softens only low-confidence sites toward LD
     //    (it is byte-identical to plain genotype where every call is confident —
     //    self-gating), so its real value is on WGS, where a handful of sites have
@@ -290,7 +310,13 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
     let mut first_chrom: Option<&[u8]> = None;
     let mut dmin = u64::MAX;
     let mut dmax = 0u64;
+    // The FORMAT ids of the first header, as the lcWGS reader takes them.
+    let (mut format_ids, mut in_header): (Vec<&str>, bool) = (Vec::new(), true);
     for line in raw.split(|&b| b == b'\n') {
+        if in_header && let Some(id) = selphi::lcwgs::pl_reader::format_line_id(line).and_then(|id| std::str::from_utf8(id).ok()) {
+            format_ids.push(id);
+        }
+        in_header &= !line.starts_with(b"#CHROM");
         if line.is_empty() || line.starts_with(b"##") || line.starts_with(b"#CHROM") { continue; }
         if line.first() == Some(&b'#') { continue; }
         n_records += 1;
@@ -304,6 +330,7 @@ fn sniff_vcf_text(raw: &[u8]) -> Sniff {
                 }
         }
     }
+    s.gq_header = selphi::lcwgs::pl_reader::gq_only_format(format_ids);
     if n_records == 0 { return s; }
     s.dens_span = if dmax >= dmin && dmin != u64::MAX { dmax - dmin } else { 0 };
     s.dens_chrom = first_chrom.map(|c| String::from_utf8_lossy(c).into_owned());
@@ -477,7 +504,7 @@ fn sniff_bcf(path: &str) -> std::io::Result<Sniff> {
     let mut reader = bcf::io::reader::Builder::default().build_from_path(path)?;
     let header = reader.read_header()?;
     let want = sample_target();
-    let mut s = Sniff::default();
+    let mut s = Sniff { gq_header: selphi::lcwgs::pl_reader::gq_only_format(header.formats().keys().map(String::as_str)), ..Sniff::default() };
     let mut taken = 0usize;
     // Density: span/count over the FIRST contiguous chromosome of the sampled
     // (front, hence consecutive) records.
@@ -706,6 +733,14 @@ pub fn resolve(
                         selphi_step!("auto-route: a variant-only likelihood file without --callable: its unlisted sites are imputed from flat likelihoods");
                     }
                 }
+                // A GT:GQ file listing under half the panel's sites in its span (a variant-only callset)
+                // stays with genotype + refine: the likelihood engine would read its omissions as flat.
+                let gq_calls = d == AutoRoute::Lcwgs && s.has_gt && !s.has_pl;
+                if gq_calls && refpanel.and_then(|rp| panel_sites_in_span(rp, &s)).is_none_or(|panel| sparse(s.dens_n, panel)) {
+                    d = AutoRoute::RefineGenotype;
+                } else if gq_calls {
+                    selphi_step!("auto-route: GT and GQ without PL at WGS density: likelihoods rebuilt from the calls");
+                }
                 // --phase-only phases called genotypes.
                 if phase_only && s.has_gt && d == AutoRoute::Lcwgs { d = AutoRoute::SparseLikelihoods; }
                 d
@@ -723,7 +758,7 @@ pub fn resolve(
                 if is_reads {
                     selphi_step!("auto-route: aligned reads (BAM/CRAM) {}", selphi::log::green("→ lcWGS engine"));
                 } else {
-                    selphi_step!("auto-route: PL (read likelihoods) or no GT {}", selphi::log::green("→ lcWGS engine"));
+                    selphi_step!("auto-route: PL (read likelihoods), GT:GQ without PL, or no GT {}", selphi::log::green("→ lcWGS engine"));
                 }
                 eff_lcwgs = true;
             }
@@ -841,6 +876,26 @@ chr22\t300\t.\tA\tG\t50\t.\t.\tGT:GQ:PL\t0/1:50:50,0,60\n";
     fn gt_with_gq_confident_wgs_density_is_refine() {
         let s = sniff(true, false, true, false, 1000, 1000);
         assert_eq!(auto_route_decision(false, &s, WGS_THR), AutoRoute::RefineGenotype);
+    }
+
+    #[test]
+    fn gt_gq_without_likelihoods_at_wgs_density_is_lcwgs() {
+        // Declared GT and GQ without PL or GL, WGS density: the likelihood engine on rebuilt likelihoods.
+        let gq = Sniff { gq_header: true, ..sniff(true, false, true, true, 1000, 1000) };
+        assert_eq!(auto_route_decision(false, &gq, WGS_THR), AutoRoute::Lcwgs);
+        // Chip density, reference blocks, or GQ undeclared: as before.
+        let chip = Sniff { gq_header: true, ..sniff_dens(true, true, 1000, 1000, 100) };
+        assert_eq!(auto_route_decision(false, &chip, WGS_THR), AutoRoute::PlainGenotype);
+        let gvcf = Sniff { ref_blocks: 3, ..gq.clone() };
+        assert_eq!(auto_route_decision(false, &gvcf, WGS_THR), AutoRoute::RefineGenotype);
+        let dp_only = Sniff { gq_header: true, has_gq: false, ..gq.clone() };
+        assert_eq!(auto_route_decision(false, &dp_only, WGS_THR), AutoRoute::RefineGenotype);
+        // The header decides, as in the reader: GT, GQ and no PL or GL.
+        let head = "##fileformat=VCFv4.2\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"x\">\n\
+##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"x\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n\
+22\t100\t.\tA\tG\t.\tPASS\t.\tGT:GQ\t0/1:40\n22\t200\t.\tA\tG\t.\tPASS\t.\tGT:GQ\t0/0:40\n";
+        assert!(sniff_vcf_text(head.as_bytes()).gq_header);
+        assert!(!sniff_vcf_text(head.replace("#CHROM", "##FORMAT=<ID=PL,Number=G,Type=Integer,Description=\"x\">\n#CHROM").as_bytes()).gq_header);
     }
 
     #[test]
