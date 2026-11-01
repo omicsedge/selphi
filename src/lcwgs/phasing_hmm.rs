@@ -1535,7 +1535,7 @@ impl PhasingHmm {
             let p = _mm512_mul_ps(t, ev);
         }
         tail {
-            self.tail_run_het(curr_het, scale, nt_s, k);
+            self.tail_run_het(curr_het, _mm512_castps512_ps256(tfreq), nt_s, k);
         }
     }
 
@@ -1558,7 +1558,7 @@ impl PhasingHmm {
             let p = _mm512_mul_ps(t, ml);
         }
         tail {
-            self.tail_run_hom(ag, mism, scale, nt_s, k);
+            self.tail_run_hom(ag, mism, _mm512_castps512_ps256(tfreq), nt_s, k);
         }
     }
 
@@ -1573,7 +1573,7 @@ impl PhasingHmm {
         }
         sel {}
         tail {
-            self.tail_flat(scale, nt_s, k, false);
+            self.tail_flat(_mm512_castps512_ps256(tfreq), nt_s, k, false);
         }
     }
 
@@ -1595,7 +1595,7 @@ impl PhasingHmm {
             let p = _mm512_mul_ps(t, ev);
         }
         tail {
-            self.tail_collapse_het(curr_het, scale, nt_s, k);
+            self.tail_collapse_het(curr_het, _mm512_castps512_ps256(tfreq), nt_s, k);
         }
     }
 
@@ -1618,7 +1618,7 @@ impl PhasingHmm {
             let p = _mm512_mul_ps(t, ml);
         }
         tail {
-            self.tail_collapse_hom(ag, mism, scale, nt_s, k);
+            self.tail_collapse_hom(ag, mism, _mm512_castps512_ps256(tfreq), nt_s, k);
         }
     }
 
@@ -1633,7 +1633,7 @@ impl PhasingHmm {
         }
         sel {}
         tail {
-            self.tail_flat(scale, nt_s, k, true);
+            self.tail_flat(_mm512_castps512_ps256(tfreq), nt_s, k, true);
         }
     }
 
@@ -1662,7 +1662,9 @@ impl PhasingHmm {
 
     // ---- AVX-512 odd-k tails (single trailing state, scalar 8-lane via AVX2) --
     // These run at most once per kernel call (n_states odd). They fold the one
-    // trailing state's 8-lane contribution into the already-stored sum.
+    // trailing state's 8-lane contribution into the already-stored sum. `tfreq` is
+    // the kernel prologue's (the previous column's prob_sum_h): store_sum512 has
+    // replaced prob_sum_h by the current column's partial sum before the tail runs.
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
@@ -1696,9 +1698,8 @@ impl PhasingHmm {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn tail_run_het(&mut self, curr_het: usize, scale: f32, nt_s: f32, k: usize) { unsafe {
+    unsafe fn tail_run_het(&mut self, curr_het: usize, tfreq: core::arch::x86_64::__m256, nt_s: f32, k: usize) { unsafe {
         use core::arch::x86_64::*;
-        let tfreq = _mm256_mul_ps(_mm256_loadu_ps(self.prob_sum_h.as_ptr()), _mm256_set1_ps(scale));
         let base = k * HAP_NUMBER;
         let pv = _mm256_loadu_ps(self.prob.as_ptr().add(base));
         let t = _mm256_fmadd_ps(pv, _mm256_set1_ps(nt_s), tfreq);
@@ -1712,9 +1713,8 @@ impl PhasingHmm {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn tail_run_hom(&mut self, ag: bool, mism: f32, scale: f32, nt_s: f32, k: usize) { unsafe {
+    unsafe fn tail_run_hom(&mut self, ag: bool, mism: f32, tfreq: core::arch::x86_64::__m256, nt_s: f32, k: usize) { unsafe {
         use core::arch::x86_64::*;
-        let tfreq = _mm256_mul_ps(_mm256_loadu_ps(self.prob_sum_h.as_ptr()), _mm256_set1_ps(scale));
         let base = k * HAP_NUMBER;
         let pv = _mm256_loadu_ps(self.prob.as_ptr().add(base));
         let t = _mm256_fmadd_ps(pv, _mm256_set1_ps(nt_s), tfreq);
@@ -1724,9 +1724,8 @@ impl PhasingHmm {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn tail_collapse_het(&mut self, curr_het: usize, scale: f32, nt_s: f32, k: usize) { unsafe {
+    unsafe fn tail_collapse_het(&mut self, curr_het: usize, tfreq: core::arch::x86_64::__m256, nt_s: f32, k: usize) { unsafe {
         use core::arch::x86_64::*;
-        let tfreq = _mm256_mul_ps(_mm256_loadu_ps(self.prob_sum_h.as_ptr()), _mm256_set1_ps(scale));
         let base = k * HAP_NUMBER;
         let t = _mm256_fmadd_ps(_mm256_set1_ps(self.prob_sum_k[k]), _mm256_set1_ps(nt_s), tfreq);
         let ev = if self.cond_bit(k) {
@@ -1739,9 +1738,8 @@ impl PhasingHmm {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn tail_collapse_hom(&mut self, ag: bool, mism: f32, scale: f32, nt_s: f32, k: usize) { unsafe {
+    unsafe fn tail_collapse_hom(&mut self, ag: bool, mism: f32, tfreq: core::arch::x86_64::__m256, nt_s: f32, k: usize) { unsafe {
         use core::arch::x86_64::*;
-        let tfreq = _mm256_mul_ps(_mm256_loadu_ps(self.prob_sum_h.as_ptr()), _mm256_set1_ps(scale));
         let base = k * HAP_NUMBER;
         let t = _mm256_fmadd_ps(_mm256_set1_ps(self.prob_sum_k[k]), _mm256_set1_ps(nt_s), tfreq);
         let ml = if ag != self.cond_bit(k) { _mm256_set1_ps(mism) } else { _mm256_set1_ps(1.0) };
@@ -1751,9 +1749,8 @@ impl PhasingHmm {
     /// FLAT tail: `collapse` uses psk broadcast, `run` uses the per-lane prob row.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2,fma")]
-    unsafe fn tail_flat(&mut self, scale: f32, nt_s: f32, k: usize, collapse: bool) { unsafe {
+    unsafe fn tail_flat(&mut self, tfreq: core::arch::x86_64::__m256, nt_s: f32, k: usize, collapse: bool) { unsafe {
         use core::arch::x86_64::*;
-        let tfreq = _mm256_mul_ps(_mm256_loadu_ps(self.prob_sum_h.as_ptr()), _mm256_set1_ps(scale));
         let base = k * HAP_NUMBER;
         let stay = if collapse {
             _mm256_set1_ps(self.prob_sum_k[k])
@@ -3356,6 +3353,53 @@ mod tests {
                             "n_haps={n_haps} k={k} b={b:?} abs={abs}");
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The AVX-512 transition kernels give every state the AVX2 kernels' value bit for bit,
+/// the trailing state of an odd state count included (its tail once read the current
+/// column's partial sum as the transition mass).
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx512_tail_tests {
+    use super::*;
+    fn setup(k: usize, seed: u64) -> PhasingHmm {
+        let mut hmm = PhasingHmm::new(&LsParams::default());
+        let mut s = seed | 1;
+        let mut nx = move || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s };
+        hmm.n_states = k;
+        hmm.prob = (0..k * HAP_NUMBER).map(|_| (((nx() >> 40) as f32) + 1.0) / (1u64 << 24) as f32 * 1e-3).collect();
+        let mut sh = [0.0f32; HAP_NUMBER];
+        for (i, &p) in hmm.prob.iter().enumerate() { sh[i % HAP_NUMBER] += p; }
+        hmm.prob_sum_h = sh;
+        hmm.prob_sum_t = sh.iter().sum();
+        hmm.prob_sum_k = (0..k).map(|j| hmm.prob[j * HAP_NUMBER..(j + 1) * HAP_NUMBER].iter().sum()).collect();
+        hmm.yt = 0.05;
+        hmm.nt = 0.95;
+        hmm
+    }
+    #[test]
+    fn avx512_transition_kernels_match_avx2_per_state() {
+        if !(is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512dq")) { return; }
+        for k in [1usize, 9, 10, 33, 64, 2001] {
+            let row: Vec<u64> = { let mut s = 99 + k as u64; (0..k.div_ceil(64)).map(|_| { s ^= s << 13; s ^= s >> 7; s ^= s << 17; s }).collect() };
+            for kernel in 0..6 {
+                let (mut a, mut b) = (setup(k, 7 + k as u64), setup(k, 7 + k as u64));
+                a.condrow = row.as_ptr();
+                b.condrow = row.as_ptr();
+                unsafe {
+                    match kernel {
+                        0 => { a.run_flat_het_avx512(); b.run_flat_het_avx2(); }
+                        1 => { a.run_peak_hom_avx512(true, 0.01); b.run_peak_hom_avx2(true, 0.01); }
+                        2 => { a.run_peak_het_avx512(1); b.run_peak_het_avx2(1); }
+                        3 => { a.collapse_flat_het_avx512(); b.collapse_flat_het_avx2(); }
+                        4 => { a.collapse_peak_hom_avx512(false, 0.01); b.collapse_peak_hom_avx2(false, 0.01); }
+                        _ => { a.collapse_peak_het_avx512(2); b.collapse_peak_het_avx2(2); }
+                    }
+                }
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&a.prob), bits(&b.prob), "k={k} kernel={kernel}");
             }
         }
     }
