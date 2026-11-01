@@ -41,6 +41,10 @@
 //!     semantics but NOT any specific bit-for-bit RNG implementation.
 
 use crate::common::HaplotypeBitmatrix;
+#[cfg(target_arch = "aarch64")]
+mod neon;
+#[cfg(test)]
+mod canon_tests;
 use crate::lcwgs::ls_params::{
     LsParams, HAP_NUMBER, VAR_FLAT_HET, VAR_PEAK_HET, VAR_PEAK_HOM,
 };
@@ -108,6 +112,9 @@ enum SimdMode {
     Avx2,
     #[cfg(target_arch = "x86_64")]
     Avx512,
+    /// The AVX-512 mode's arithmetic on aarch64 (see `neon`).
+    #[cfg(target_arch = "aarch64")]
+    Neon,
 }
 
 #[inline]
@@ -120,6 +127,10 @@ fn resolve_simd_mode() -> SimdMode {
         if use_avx2_g2p() {
             return SimdMode::Avx2;
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if !crate::config::is_one("SELPHI_FORCE_SCALAR") && std::arch::is_aarch64_feature_detected!("neon") {
+        return SimdMode::Neon;
     }
     SimdMode::Scalar
 }
@@ -546,7 +557,7 @@ impl PhasingHmm {
     /// Gathers through the extract plans built at the head of `rephase`
     /// (`plan_full` over `cond_haps`, `plan_tail` over `cond_haps[b..]`), so it
     /// writes every one of the `w64` words and needs no zeroing first.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[inline]
     fn pack_condbits(&mut self, ref_bm: &HaplotypeBitmatrix, cond_haps: &[u32]) {
         use crate::common::bit_gather::gather_row;
@@ -634,7 +645,7 @@ impl PhasingHmm {
     /// Build the per-call gather plans `pack_condbits` reads (SIMD paths only):
     /// `plan_full` over all of `cond_haps`, `plan_tail` over the states after
     /// the base prefix when the base pack is usable. O(K) once per `rephase`.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn build_condbit_plans(&mut self, cond_haps: &[u32], n_ref: usize) {
         self.plan_full.build(cond_haps, n_ref);
         self.plan_tail.build(&[], n_ref);
@@ -664,6 +675,13 @@ impl PhasingHmm {
                 return;
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            // SAFETY: NEON is baseline on aarch64; the row was packed for this site.
+            unsafe { self.init_peak_het_neon(curr_het) };
+            return;
         }
         self.init_peak_het_scalar(curr_het, ref_bm, cond_haps);
     }
@@ -699,6 +717,13 @@ impl PhasingHmm {
                 return;
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            // SAFETY: NEON is baseline on aarch64; the row was packed for this site.
+            unsafe { self.init_peak_hom_neon(ag, mism) };
+            return;
         }
         self.init_peak_hom_scalar(ag, ref_bm, cond_haps, mism);
     }
@@ -747,6 +772,13 @@ impl PhasingHmm {
             }
             SimdMode::Scalar => {}
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            // SAFETY: NEON is baseline on aarch64; the row was packed for this site.
+            unsafe { self.run_peak_het_neon(curr_het) };
+            return;
+        }
         self.run_peak_het_scalar(curr_het, ref_bm, cond_haps);
     }
 
@@ -789,6 +821,13 @@ impl PhasingHmm {
                 return;
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            // SAFETY: NEON is baseline on aarch64; the row was packed for this site.
+            unsafe { self.run_peak_hom_neon(ag, mism) };
+            return;
         }
         self.run_peak_hom_scalar(ag, ref_bm, cond_haps, mism);
     }
@@ -833,6 +872,12 @@ impl PhasingHmm {
             }
             SimdMode::Scalar => {}
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe { self.run_flat_het_neon() };
+            return;
+        }
         self.run_flat_het_scalar();
     }
 
@@ -872,6 +917,13 @@ impl PhasingHmm {
                 return;
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            // SAFETY: NEON is baseline on aarch64; the row was packed for this site.
+            unsafe { self.collapse_peak_het_neon(curr_het) };
+            return;
         }
         self.collapse_peak_het_scalar(curr_het, ref_bm, cond_haps);
     }
@@ -917,6 +969,13 @@ impl PhasingHmm {
             }
             SimdMode::Scalar => {}
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            // SAFETY: NEON is baseline on aarch64; the row was packed for this site.
+            unsafe { self.collapse_peak_hom_neon(ag, mism) };
+            return;
+        }
         self.collapse_peak_hom_scalar(ag, ref_bm, cond_haps, mism);
     }
 
@@ -960,6 +1019,12 @@ impl PhasingHmm {
                 return;
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            // SAFETY: NEON is baseline on aarch64.
+            unsafe { self.collapse_flat_het_neon() };
+            return;
         }
         self.collapse_flat_het_scalar();
     }
@@ -1012,6 +1077,17 @@ impl PhasingHmm {
                     || self.sum_hprobs < F32_TINY;
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            let states_haps = self.n_states * HAP_NUMBER;
+            let seg_base = (self.curr_segment_index as usize + 1) * states_haps;
+            let fwd = TransInput { prob: self.prob.as_ptr(), sum_h: self.prob_sum_h, sum_t: self.prob_sum_t };
+            // SAFETY: `prob` holds K x 8 floats and the next segment's block lies in `phasing_prob`.
+            (self.hprobs, self.sum_hprobs) = unsafe {
+                Self::trans_hap_neon_raw(self.n_states, self.yt, self.nt, &fwd, self.phasing_prob.as_ptr().add(seg_base))
+            };
+            return self.sum_hprobs.is_nan() || self.sum_hprobs.is_infinite() || self.sum_hprobs < F32_TINY;
         }
         self.trans_hap_scalar();
         self.sum_hprobs.is_nan() || self.sum_hprobs.is_infinite() || self.sum_hprobs < F32_TINY
@@ -1086,6 +1162,11 @@ impl PhasingHmm {
                 return self.impute_flat_het_avx2(bwd, bwd_sum, fwd, fwd_sum);
             }
             SimdMode::Scalar => {}
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            self.pack_condbits(ref_bm, cond_haps);
+            return self.impute_flat_het_neon(bwd, bwd_sum, fwd, fwd_sum);
         }
         self.impute_flat_het_scalar(ref_bm, cond_haps, bwd, bwd_sum, fwd, fwd_sum)
     }}
@@ -2191,6 +2272,10 @@ impl PhasingHmm {
             SimdMode::Avx512 | SimdMode::Avx2 => return Self::trans_hap_avx2_raw(self.n_states, yt, nt, fwd, bwd),
             SimdMode::Scalar => {}
         }
+        #[cfg(target_arch = "aarch64")]
+        if self.simd == SimdMode::Neon {
+            return Self::trans_hap_neon_raw(self.n_states, yt, nt, fwd, bwd);
+        }
         trans_hap_scalar_raw(self.n_states, yt, nt, fwd, bwd)
     }}
 
@@ -2561,7 +2646,7 @@ impl PhasingHmm {
         let potentials = links.and_then(|(l, floor)| crate::lcwgs::linkage::phase::Potentials::build(
             l, &self.var_typ, &self.var_abs, &self.segments, floor));
         self.allocate_snapshots();
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if self.simd != SimdMode::Scalar {
             self.build_condbit_plans(cond_haps, ref_bm.n_haps);
         }

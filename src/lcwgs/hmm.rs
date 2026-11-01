@@ -63,6 +63,10 @@ use crate::common::bit_gather::{GatherPlan, gather_row};
 
 pub(crate) mod two_pass;
 mod anchored;
+#[cfg(target_arch = "aarch64")]
+mod neon;
+#[cfg(test)]
+mod canon_tests;
 
 // Gated micro-profiling (LCWGS_TIMING): nanoseconds spent building the bit-packed
 // conditioning (`condbits`, the random-gather pack) vs the rest of the HMM
@@ -726,11 +730,11 @@ pub(crate) fn run_forward_backward_with(
     if use_avx2_lcwgs() {
         return unsafe { run_fb_avx2(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
     }
-    // NEON fast path (aarch64: Apple Silicon / ARM servers). 4-wide analogue of
-    // the AVX2 path; falls back to scalar below under SELPHI_FORCE_SCALAR=1.
+    // NEON fast path (aarch64: Graviton, Apple Silicon): the AVX-512 path's
+    // arithmetic, bit-identical to it; scalar below under SELPHI_FORCE_SCALAR=1.
     #[cfg(target_arch = "aarch64")]
     if use_neon_lcwgs() {
-        return unsafe { run_fb_neon(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
+        return unsafe { neon::run_fb(hl, cond_haps, ref_bm, cm, params, recomb_mult, poly_sites, prepack) };
     }
 
     let inv_k = 1.0f32 / (k as f32);
@@ -1584,214 +1588,6 @@ unsafe fn fwd_col_neon(
     s
 }}
 
-/// NEON checkpointed forward-backward (4-wide mirror of [`run_fb_avx2`]).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn run_fb_neon(
-    hl: &[f32],
-    cond_haps: &[u32],
-    ref_bm: &HaplotypeBitmatrix,
-    cm: &[f64],
-    params: &LcwgsParams,
-    recomb_mult: Option<&[f32]>,
-    poly_sites: Option<&[usize]>, // compacted→absolute ref_bm row map (LCWGS_POLY_SKIP)
-    prepack: Option<&[u64]>,      // caller-built condbits (see pack_cond_rows), else pack here
-) -> HmmOutput { unsafe {
-    use core::arch::aarch64::*;
-    let n_var = cm.len();
-    let k = cond_haps.len();
-    let inv_k = 1.0f32 / (k as f32);
-    let ee = 1.0f32 - params.epsilon;
-    let ed = params.epsilon;
-    let loo = lcwgs_loo();
-    let w64 = k.div_ceil(64);
-    let kmain4 = k & !3usize; // largest multiple of 4 ≤ k
-    let zero = vdupq_n_f32(0.0);
-
-    let mut dosage = vec![0.0f32; n_var];
-
-    let mut owned_pack = if prepack.is_none() { take_pack_scratch(n_var * w64) } else { Vec::new() };
-    let packed = match prepack {
-        Some(p) => p,
-        None => {
-            pack_cond_rows(ref_bm, cond_haps, poly_sites, n_var, None, &mut owned_pack);
-            owned_pack.as_slice()
-        }
-    };
-    TL_ALPHA.with(|ca| TL_ALPHA_SUM.with(|cs| TL_BETA.with(|cb| TL_EMIT.with(|ce| TL_PREC.with(|cp| {
-        let mut alpha = ca.borrow_mut();
-        let mut alpha_sum = cs.borrow_mut();
-        let mut beta = cb.borrow_mut();
-        let mut emit = ce.borrow_mut();
-        let mut p_rec = cp.borrow_mut();
-
-        precompute_emit(hl, n_var, ee, ed, &mut emit);
-        let scale = recomb_scale(params.ne, k, ref_bm.n_haps);
-        precompute_prec(cm, n_var, scale, recomb_mult, &mut p_rec);
-        // Bit-packed conditioning alleles (1 bit/state): the caller's pre-built
-        // pack when it has one (shared-prefix assembly across a sample's two
-        // haplotypes), else built before borrowing the kernel scratch. Both
-        // routes produce identical words (see `pack_cond_rows`).
-        let timing = hmm_timing();
-        debug_assert!(packed.len() >= n_var * w64);
-        let cbp = packed.as_ptr();
-        let t_fb = if timing { Some(std::time::Instant::now()) } else { None };
-
-        // Checkpointed forward + block-recompute backward (see run_fb_avx512).
-        let chk_stride = ((n_var as f64).sqrt().ceil() as usize).max(1);
-        let n_chk = n_var.div_ceil(chk_stride);
-        let need_chk = n_chk * k;
-        let (la, ls, lb) = (alpha.len(), alpha_sum.len(), beta.len());
-        if la < need_chk { alpha.reserve_exact(need_chk - la); }
-        if ls < n_var { alpha_sum.reserve_exact(n_var - ls); }
-        if lb < k { beta.reserve_exact(k - lb); }
-        alpha.set_len(need_chk); alpha_sum.set_len(n_var); beta.set_len(k);
-        let chkp = alpha.as_mut_ptr();
-        let bp = beta.as_mut_ptr();
-        let blkp = tl_scratch_ptr(&TL_BLK, chk_stride * k);
-        let fcolp = tl_scratch_ptr(&TL_FCOL, 2 * k);
-        let last = n_var - 1;
-        let e0l = emit[2 * last]; let e1l = emit[2 * last + 1];
-
-        // Initial forward (base case v=0 → fcol[0..k]).
-        {
-            let e0 = vdupq_n_f32(emit[0]);
-            let e1 = vdupq_n_f32(emit[1]);
-            let invkv = vdupq_n_f32(inv_k);
-            let mut sumv = vdupq_n_f32(0.0);
-            let mut j = 0;
-            while j < kmain4 {
-                let m = lane_mask4(cbp, 0, j);
-                let ev = vbslq_f32(m, e1, e0);
-                let p = vmulq_f32(ev, invkv);
-                vst1q_f32(fcolp.add(j), p);
-                sumv = vaddq_f32(sumv, p);
-                j += 4;
-            }
-            let mut s0 = vaddvq_f32(sumv);
-            while j < k {
-                let a = (*cbp.add(j / 64) >> (j % 64)) & 1 != 0;
-                let p = inv_k * if a { emit[1] } else { emit[0] };
-                *fcolp.add(j) = p; s0 += p; j += 1;
-            }
-            alpha_sum[0] = s0;
-            std::ptr::copy_nonoverlapping(fcolp, chkp, k);
-        }
-        let (mut prev, mut curr) = (fcolp, fcolp.add(k));
-        for v in 1..n_var {
-            let s = fwd_col_neon(
-                prev, curr, v, emit[2 * v], emit[2 * v + 1],
-                p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain4, w64);
-            alpha_sum[v] = s;
-            if v % chk_stride == 0 {
-                let c = v / chk_stride;
-                std::ptr::copy_nonoverlapping(curr, chkp.add(c * k), k);
-            }
-            roll_forward(&mut prev, &mut curr, k);
-        }
-
-        // Backward: blocks in reverse, recompute then backward kernel.
-        let mut beta_sum = 0.0f32;
-        let mut init_done = false;
-        for b in (0..n_chk).rev() {
-            let lo = b * chk_stride;
-            let hi = ((b + 1) * chk_stride).min(n_var);
-            std::ptr::copy_nonoverlapping(chkp.add(b * k), blkp, k);
-            for i in 1..(hi - lo) {
-                let v = lo + i;
-                fwd_col_neon(
-                    blkp.add((i - 1) * k), blkp.add(i * k), v, emit[2 * v], emit[2 * v + 1],
-                    p_rec[v], alpha_sum[v - 1], cbp, inv_k, k, kmain4, w64);
-            }
-            for v in (lo..hi).rev() {
-                let acol = blkp.add((v - lo) * k);
-                if !init_done {
-                    let e0 = vdupq_n_f32(e0l); let e1 = vdupq_n_f32(e1l);
-                    let invkv = vdupq_n_f32(inv_k);
-                    let base = last * w64;
-                    let mut bsumv = vdupq_n_f32(0.0);
-                    let mut p1v = vdupq_n_f32(0.0); let mut p0v = vdupq_n_f32(0.0);
-                    let mut j = 0;
-                    while j < kmain4 {
-                        let m = lane_mask4(cbp, base, j);
-                        let ev = vbslq_f32(m, e1, e0);
-                        let bv = vmulq_f32(ev, invkv);
-                        vst1q_f32(bp.add(j), bv);
-                        bsumv = vaddq_f32(bsumv, bv);
-                        let av = vld1q_f32(acol.add(j));
-                        let postv = vmulq_f32(av, invkv);
-                        p1v = vaddq_f32(p1v, vbslq_f32(m, postv, zero));
-                        p0v = vaddq_f32(p0v, vbslq_f32(m, zero, postv));
-                        j += 4;
-                    }
-                    beta_sum = vaddvq_f32(bsumv);
-                    let mut prob_hid_1 = vaddvq_f32(p1v);
-                    let mut prob_hid_0 = vaddvq_f32(p0v);
-                    while j < k {
-                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
-                        let e = if a { e1l } else { e0l };
-                        let bb = inv_k * e; *bp.add(j) = bb; beta_sum += bb;
-                        let post = *acol.add(j) * inv_k;
-                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
-                        j += 1;
-                    }
-                    dosage[last] = finalize_site(
-                        loo, prob_hid_0, prob_hid_1, e0l, e1l,
-                        hl[2 * last], hl[2 * last + 1], ee, ed,
-                    );
-                    init_done = true;
-                } else {
-                    let pr = p_rec[v + 1];
-                    let fact1 = pr * inv_k;
-                    let fact2 = (1.0 - pr) / beta_sum.max(f32::MIN_POSITIVE);
-                    let e0s = emit[2 * v]; let e1s = emit[2 * v + 1];
-                    let e0 = vdupq_n_f32(e0s); let e1 = vdupq_n_f32(e1s);
-                    let f1v = vdupq_n_f32(fact1); let f2v = vdupq_n_f32(fact2);
-                    let base = v * w64;
-                    let mut bsumv = vdupq_n_f32(0.0);
-                    let mut p1v = vdupq_n_f32(0.0); let mut p0v = vdupq_n_f32(0.0);
-                    let mut j = 0;
-                    while j < kmain4 {
-                        let bprev = vld1q_f32(bp.add(j));
-                        let bun = vfmaq_f32(f1v, bprev, f2v); // f1v + bprev*f2v
-                        let av = vld1q_f32(acol.add(j));
-                        let postv = vmulq_f32(av, bun);
-                        let m = lane_mask4(cbp, base, j);
-                        p1v = vaddq_f32(p1v, vbslq_f32(m, postv, zero));
-                        p0v = vaddq_f32(p0v, vbslq_f32(m, zero, postv));
-                        let ev = vbslq_f32(m, e1, e0);
-                        let nb = vmulq_f32(bun, ev);
-                        vst1q_f32(bp.add(j), nb);
-                        bsumv = vaddq_f32(bsumv, nb);
-                        j += 4;
-                    }
-                    let mut new_beta_sum = vaddvq_f32(bsumv);
-                    let mut prob_hid_1 = vaddvq_f32(p1v);
-                    let mut prob_hid_0 = vaddvq_f32(p0v);
-                    while j < k {
-                        let a = (*cbp.add(base + j / 64) >> (j % 64)) & 1 != 0;
-                        let e = if a { e1s } else { e0s };
-                        let bun = *bp.add(j) * fact2 + fact1;
-                        let post = *acol.add(j) * bun;
-                        if a { prob_hid_1 += post; } else { prob_hid_0 += post; }
-                        let nb = bun * e; *bp.add(j) = nb; new_beta_sum += nb;
-                        j += 1;
-                    }
-                    beta_sum = new_beta_sum;
-                    dosage[v] = finalize_site(
-                        loo, prob_hid_0, prob_hid_1, e0s, e1s,
-                        hl[2 * v], hl[2 * v + 1], ee, ed,
-                    );
-                }
-            }
-        }
-        if let Some(t) = t_fb { PROF_FB_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed); }
-    })))));
-    if prepack.is_none() { TL_CONDBITS.with(|c| *c.borrow_mut() = owned_pack); }
-
-    HmmOutput { dosage }
-}}
-
 /// GLIMPSE2-style scaffold HMM: run forward-backward ONLY on the common
 /// (scaffold) sites, then impute ALL sites (common + rare) by interpolating
 /// the per-state posterior between flanking scaffold sites, with GL-weighted
@@ -2642,8 +2438,8 @@ mod tests {
     ///   - k=203 = 12·16+11 = 25·8+3  → both the 16-wide AND 8-wide scalar tails,
     ///   - mixed within-word condbits (non-trivial lane masks),
     ///   - n_var=40 > chk_stride(=⌈√40⌉=7) → multiple checkpoint blocks recomputed.
-    /// The NEON path (run_fb_neon) is the same 4-wide structure but aarch64-only;
-    /// it needs the equivalent gate run on real ARM (see the run_fb_neon doc).
+    /// The NEON path (neon::run_fb) has the AVX-512 arithmetic, pinned by
+    /// canon_tests::simd_fb_matches_canonical_bits.
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn avx512_avx2_fb_equivalence() {
