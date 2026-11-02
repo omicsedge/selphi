@@ -2298,8 +2298,7 @@ mod tests {
             // allele `m_alt = ref_bm.get(v, cond[0])`, so finalize_site with the
             // unit-mass posterior (loo=false; the mass + LOO divisor cancel) gives the
             // exact full-FB dose: ed·h1/(ee·h0+ed·h1) (REF-major) or ee·h1/(ed·h0+ee·h1).
-            let ee = 1.0f32 - params.epsilon;
-            let ed = params.epsilon;
+            let (ee, ed) = params.output_emission();
             for &v in &split.mono {
                 let m_alt = mono_alt[v]; // == ref_bm.get(v, cond[0]) at a mono site
                 dose[v] = crate::lcwgs::hmm::finalize_site(

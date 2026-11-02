@@ -170,7 +170,7 @@ fn simd_fb_matches_canonical_bits() {
     use reference_pack as rp;
     let Some(kernel) = canonical_kernel() else { eprintln!("no canonical FB kernel on this host"); return };
     let mut rng = rp::Xs(0x5EED_CA70_0F1B_2D3C);
-    for params in [LcwgsParams::default(), LcwgsParams { novel_emission: 1e-6, ..Default::default() }] {
+    for params in [LcwgsParams { novel_emission: 0.0, ..Default::default() }, LcwgsParams { novel_emission: 1e-6, ..Default::default() }] {
     for n in [1usize, 2, 17, 40, 130] {
         let bm = rp::random_panel(&mut rng, n * 2, 700, 40);
         let poly: Vec<usize> = (0..n).map(|v| v * 2 + (v % 2)).collect();
@@ -260,12 +260,12 @@ fn dispatcher_matches_canonical_bits() {
     let mut tab = vec![1.0f32; 2];
     tab.resize(MIN_TABLE, 0.0);
     let plan = Plan { at: vec![0], rows_off: vec![0, 1], rows: vec![0], tab_off: vec![0, MIN_TABLE as u32], tab, floor: 0.0 };
-    let params = LcwgsParams { epsilon: 1e-12, ..Default::default() };
+    let params = LcwgsParams { epsilon: 1e-12, novel_emission: 0.0, ..Default::default() };
     let d = check(&[0.1, 0.9], &cond, &bm, &[0.0], &params, None, Some(&plan), "witness");
     if lcwgs_loo() { assert_eq!(d[0].to_bits(), 0x3f2c_cccd); }
 
     let mut rng = rp::Xs(0xD15B_A7C4_0A11_CE55);
-    for params in [LcwgsParams::default(), LcwgsParams { novel_emission: 1e-6, ..Default::default() }] {
+    for params in [LcwgsParams { novel_emission: 0.0, ..Default::default() }, LcwgsParams { novel_emission: 1e-6, ..Default::default() }] {
     for &(n, n_haps) in &[(40usize, 300usize), (4100, 90)] {
         let bm = rp::random_panel(&mut rng, n * 2, n_haps, 40);
         let poly: Vec<usize> = (0..n).map(|v| v * 2 + (v % 2)).collect();

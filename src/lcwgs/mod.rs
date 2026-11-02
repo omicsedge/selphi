@@ -116,7 +116,7 @@ pub struct LcwgsParams {
     pub min_gl: f32,
     /// Emission of an allele the copied haplotypes do not carry, in the posterior dose of a site
     /// only ([`Self::output_emission`]; with the leave-one-out division that is the posterior of
-    /// this emission at that one site): `LCWGS_NOVEL_EMISSION`, 0 = `epsilon`, as before. With
+    /// this emission at that one site): `LCWGS_NOVEL_EMISSION`, default 1e-6, 0 = `epsilon`. With
     /// `epsilon` (1e-12) against the `min_gl` floor (1e-10) such an allele got at most 1% of a
     /// haplotype however sharp its likelihood, so a confident rare heterozygote came out hom-ref.
     pub novel_emission: f32,
@@ -229,7 +229,11 @@ impl Default for LcwgsParams {
             // 0.9196→0.9239 (plateaus by 1e-8). Tunable via LCWGS_EPSILON.
             epsilon: envf("LCWGS_EPSILON", 1e-12),
             min_gl: envf("LCWGS_MIN_GL", 1e-10),
-            novel_emission: envf("LCWGS_NOVEL_EMISSION", 0.0),
+            // 1e-6 (pre-registered held-out rule, 2026-11-02): confident hets the panel copies
+            // without their allele kept (HG003-7 chr20 PL ~12x: 255 true hets hom-ref -> 18),
+            // per-sample R2 up to +0.0002, the <0.5% bin +0.004..+0.006 at >= 4x; 0.5-2x within
+            // seed noise. 0 = epsilon, the previous output.
+            novel_emission: envf("LCWGS_NOVEL_EMISSION", 1e-6),
             // GLIMPSE2's default seed. `LCWGS_SEED` overrides it: the Gibbs chain is
             // deterministic for a fixed seed, so a second seed is the only way to
             // measure how much of a per-sample delta is chain reshuffling.

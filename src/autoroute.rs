@@ -189,9 +189,9 @@ fn auto_route_decision(is_reads: bool, s: &Sniff, wgs_density_thr: f64) -> AutoR
     }
     // 4. GT and GQ without PL at WGS density (a callset written without its likelihoods): the
     //    likelihood engine, on the likelihoods each call stands for (`pl_reader::gq_pl`). HG002 chr22
-    //    at 4.46x / 11.16x / 33.5x, per-sample R² 0.9695 / 0.9964 / 0.9982 against 0.9476 / 0.9864 /
-    //    0.9976 for genotype + refine; HG003-HG007 chr20 at ~4.8x / ~12x / ~36x, +0.021 / +0.012 / +0.0009
-    //    on average, every sample and MAF bin at or above refine. A chip array carrying GQ stays below the density gate; a gVCF or
+    //    at 4.46x / 11.16x / 33.5x, per-sample R² 0.9691 / 0.9965 / 0.9982 against 0.9476 / 0.9864 /
+    //    0.9976 for genotype + refine; HG003-HG007 chr20 at ~4.8x / ~12x / ~36x, +0.021 / +0.012 / +0.001
+    //    on average, every MAF bin above refine on average. A chip array carrying GQ stays below the density gate; a gVCF or
     //    all-sites file (not measured) and, in `resolve`, a sparse file stay with refine.
     if s.gq_header && s.has_gq && s.ref_blocks == 0 && s.density_per_mb() >= wgs_density_thr && gq_likelihoods() {
         return AutoRoute::Lcwgs;

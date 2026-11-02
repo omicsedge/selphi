@@ -238,9 +238,6 @@ pub struct PlVcfResult {
     pub haploid_samples: Vec<bool>,
     /// Reference blocks covering a panel position (see [`BlockSites`]).
     pub blocks: RefBlocks,
-    /// A GT:GQ file's typed calls to write as called, laid out as `gl3` without its 3
-    /// (`[v * n_samples + s]`: the ALT count, or [`NO_CALL`]); empty for any other file.
-    pub calls: Vec<u8>,
 }
 
 /// The panel contig and its sorted variant positions: the reference blocks a file writes there
@@ -289,26 +286,6 @@ fn depth_pl(d: i32, haploid: bool) -> ([i32; 3], bool) {
     if haploid { (haploid_pl(0, alt), true) } else { ([0, het, alt], false) }
 }
 
-/// A file whose FORMAT header declares GT and GQ but neither PL nor GL (a callset written without
-/// its likelihoods): each call stands for the likelihoods [`gq_pl`] rebuilds from it, and the
-/// calls of at least `keep` GQ are written as called ([`call_dose`]). Decided on the header alone,
-/// so a file with PL or GL is read as before, record for record.
-#[derive(Clone, Copy)]
-struct GqCalls { keep: i32 }
-
-impl GqCalls {
-    /// The mode for a header declaring these FORMAT ids (`None` unless [`gq_only_format`]).
-    fn from_format_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Option<Self> {
-        gq_only_format(ids).then(|| GqCalls { keep: gq_keep() })
-    }
-
-    /// The mode for one record: a record whose FILTER fails keeps none of its calls (they are
-    /// no-calls, as in the genotype readers), though its likelihoods are read as any file's are.
-    fn for_record(self, filter_failed: bool) -> Self {
-        if filter_failed && crate::io::target_io::input_filter_missing() { GqCalls { keep: 0 } } else { self }
-    }
-}
-
 /// The ID of a `##FORMAT=<...>` header line, wherever it stands among the line's fields.
 pub fn format_line_id(line: &[u8]) -> Option<&[u8]> {
     let body = line.strip_prefix(b"##FORMAT=<")?;
@@ -331,19 +308,15 @@ pub fn format_line_id(line: &[u8]) -> Option<&[u8]> {
     None
 }
 
-/// Whether a header's FORMAT ids declare GT and GQ but neither PL nor GL: the file this engine
-/// reads as likelihoods rebuilt from its calls (the auto-route asks the same).
+/// Whether a header's FORMAT ids declare GT and GQ but neither PL nor GL (a callset written without
+/// its likelihoods): each call is read as the likelihoods [`gq_pl`] rebuilds from it. Decided on the
+/// header alone, so a file with PL or GL is read as before, record for record; the auto-route asks the same.
 pub fn gq_only_format<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
     let (mut gt, mut gq, mut pl) = (false, false, false);
     for id in ids {
         match id { "GT" => gt = true, "GQ" => gq = true, "PL" | "GL" => pl = true, _ => {} }
     }
     gt && gq && !pl
-}
-
-/// The GQ from which a GT:GQ file's typed calls are written as called (`LCWGS_GQ_KEEP`; 0 = none).
-fn gq_keep() -> i32 {
-    crate::config::raw("LCWGS_GQ_KEEP").and_then(|v| v.trim().parse::<i32>().ok()).filter(|&v| v >= 0).unwrap_or(50)
 }
 
 /// How much further than the heterozygote a homozygous call's other homozygote lies, in Phred:
@@ -369,18 +342,6 @@ fn gq_pl(gt: &[Option<u32>], gq: i32, n_alleles: usize) -> Option<Vec<i32>> {
     }).collect())
 }
 
-/// No typed call kept at a site ([`call_dose`]).
-pub(crate) const NO_CALL: u8 = u8::MAX;
-
-/// A diploid call's count of allele `k` (of `n_alleles`) when its GQ reaches `keep`, else [`NO_CALL`].
-fn call_dose(gt: Option<&[Option<u32>]>, gq: Option<i32>, keep: i32, k: u32, n_alleles: usize) -> u8 {
-    match (gt, gq) {
-        (Some([Some(a), Some(b)]), Some(q)) if keep > 0 && q >= keep && (*a.max(b) as usize) < n_alleles =>
-            u8::from(*a == k) + u8::from(*b == k),
-        _ => NO_CALL,
-    }
-}
-
 /// A sample column's text without the `\r` of a CRLF line (its last column).
 fn no_cr(field: &[u8]) -> &[u8] { field.strip_suffix(b"\r").unwrap_or(field) }
 
@@ -395,8 +356,8 @@ struct SampleFields { pl: Option<Vec<i32>>, gt: Option<Vec<Option<u32>>>, dp: Op
 
 impl SampleFields {
     /// A GT:GQ file's sample without `PL` or `GL` of its own: its likelihoods are those its call stands for.
-    fn with_gq_pl(mut self, gq: Option<GqCalls>, n_alleles: usize) -> Self {
-        if gq.is_some() && self.pl.is_none() {
+    fn with_gq_pl(mut self, gq: bool, n_alleles: usize) -> Self {
+        if gq && self.pl.is_none() {
             self.pl = self.gt.as_deref().zip(self.gq).and_then(|(gt, q)| gq_pl(gt, q, n_alleles));
             self.rebuilt = true;
         }
@@ -486,14 +447,13 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
     if n_samples == 0 {
         return Err(std::io::Error::other(format!("No samples in BCF {path}")));
     }
-    let gq_mode = GqCalls::from_format_ids(header.formats().keys().map(String::as_str));
+    let gq = gq_only_format(header.formats().keys().map(String::as_str));
     let mut body = Body::new(n_samples, 0);
 
     for result in reader.record_bufs(&header) {
         let rec = result?;
         let pos = match rec.variant_start() { Some(p) => usize::from(p) as i64, None => continue };
         if pos < 1 { continue; }
-        let gq = gq_mode.map(|g| g.for_record(crate::io::target_io::filters_failed(rec.filters().as_ref().iter().map(String::as_str))));
         // A record on another contig than the run's matches no panel site: not kept.
         if keep.is_some() && !on_contig(rec.reference_sequence_name().as_bytes(), keep) { continue; }
         let alts = rec.alternate_bases().as_ref();
@@ -514,7 +474,7 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
                 rebuilt: false,
             }.with_gq_pl(gq, alts.len() + 1) }).collect();
             let r = SlowRecord { chrom: rec.reference_sequence_name().as_bytes(), pos, ref_bytes: rec.reference_bases().as_bytes(), alts, end };
-            slow_record(&r, &fields, n_samples, hash_alleles_against_srp, on_contig(r.chrom, keep), gq, &mut body);
+            slow_record(&r, &fields, n_samples, hash_alleles_against_srp, on_contig(r.chrom, keep), &mut body);
             if let Some(k) = keep { keep_block(&r, &fields, n_samples, k, &mut body); }
             continue;
         }
@@ -543,33 +503,27 @@ fn parse_pl_bcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&BlockS
                 sample.get("PL").flatten().and_then(bcf_value_to_pl3)
                     .or_else(|| bcf_sample_pl(&sample).as_deref().and_then(pl_list_field))
             };
-            // A GT:GQ file: the likelihoods its call stands for, and the call kept when sure.
-            let pl_opt = match gq.filter(|_| !bcf_filtered) {
-                Some(g) => {
-                    let gt: Option<Vec<Option<u32>>> = match sample.get("GT").flatten() {
-                        Some(Value::Genotype(x)) => Some(x.as_ref().iter().map(|a| a.position().map(|p| p as u32)).collect()),
-                        _ => None };
-                    let q = match sample.get("GQ").flatten() { Some(Value::Integer(q)) => Some(*q), _ => None };
-                    body.calls.push(if pl_opt.is_some() { NO_CALL } else { call_dose(gt.as_deref(), q, g.keep, 1, 2) });
-                    pl_opt.or_else(|| gt.zip(q).and_then(|(gt, q)| gq_pl(&gt, q, 2)).as_deref().and_then(pl_list_field))
-                }
-                None => { if gq.is_some() { body.calls.push(NO_CALL); } pl_opt }
-            };
+            // A GT:GQ file: the likelihoods its call stands for.
+            let pl_opt = if gq && !bcf_filtered && pl_opt.is_none() {
+                let gt: Option<Vec<Option<u32>>> = match sample.get("GT").flatten() {
+                    Some(Value::Genotype(x)) => Some(x.as_ref().iter().map(|a| a.position().map(|p| p as u32)).collect()),
+                    _ => None };
+                let q = match sample.get("GQ").flatten() { Some(Value::Integer(q)) => Some(*q), _ => None };
+                gt.zip(q).and_then(|(gt, q)| gq_pl(&gt, q, 2)).as_deref().and_then(pl_list_field)
+            } else { pl_opt };
             if here && pl_opt.is_some_and(|p| p.1) { body.haploid_samples[s] = true; }
             let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
             if !valid { body.n_missing_pl += 1; }
             body.gl3[gl_off + 3 * s..gl_off + 3 * s + 3].copy_from_slice(&glp);
         }
-        // A record with fewer samples than the header: the rest keep no call.
-        if gq.is_some() { body.calls.resize(body.markers.len() * n_samples, NO_CALL); }
     }
 
-    let Body { markers, gl3, n_variants_seen, n_missing_pl, haploid_samples, blocks, calls } = body;
+    let Body { markers, gl3, n_variants_seen, n_missing_pl, haploid_samples, blocks } = body;
     selphi_info!(
         "  PL BCF: {} samples, {} variants ({} sample-sites with missing/malformed PL → flat 0.5/0.5){}{}",
-        n_samples, n_variants_seen, n_missing_pl, blocks_note(&blocks), gq_note(gq_mode),
+        n_samples, n_variants_seen, n_missing_pl, blocks_note(&blocks), gq_note(gq),
     );
-    Ok(PlVcfResult { gl3, markers, sample_ids, haploid_samples, blocks, calls })
+    Ok(PlVcfResult { gl3, markers, sample_ids, haploid_samples, blocks })
 }
 
 /// The fields of a record the slow path reads (several ALTs, a placeholder, or none).
@@ -578,7 +532,7 @@ struct SlowRecord<'a> { chrom: &'a [u8], pos: i64, ref_bytes: &'a [u8], alts: Ve
 /// A record with several ALTs or a reference placeholder: one marker per ALT that is not a
 /// placeholder, each with its own `PL` subset ([`pl_subset`]), as `bcftools norm -m-` splits it.
 /// The VCF-text and BCF readers both call it, so a file and its BCF copy give the same GLs.
-fn slow_record(r: &SlowRecord, fields: &[SampleFields], n_samples: usize, hash: bool, here: bool, gq: Option<GqCalls>, out: &mut Body) {
+fn slow_record(r: &SlowRecord, fields: &[SampleFields], n_samples: usize, hash: bool, here: bool, out: &mut Body) {
     let n_alleles = r.alts.len() + 1;
     for (k, alt) in r.alts.iter().enumerate().map(|(i, a)| (i + 1, *a)) {
         if is_placeholder(alt) { continue; }
@@ -598,10 +552,6 @@ fn slow_record(r: &SlowRecord, fields: &[SampleFields], n_samples: usize, hash: 
             let (_, glp, valid) = pl_to_hl_gl3(pl.map(|p| p.0));
             if !valid { out.n_missing_pl += 1; }
             out.gl3[gl_off + 3 * s..gl_off + 3 * s + 3].copy_from_slice(&glp);
-            if let Some(g) = gq {
-                out.calls.push(fields.get(s).filter(|f| f.rebuilt)
-                    .map_or(NO_CALL, |f| call_dose(f.gt.as_deref(), f.gq, g.keep, k as u32, n_alleles)));
-            }
         }
     }
 }
@@ -640,13 +590,7 @@ fn blocks_note(b: &RefBlocks) -> String {
 }
 
 /// Log suffix for a GT:GQ file.
-fn gq_note(gq: Option<GqCalls>) -> String {
-    match gq {
-        Some(g) if g.keep > 0 => format!("; no PL or GL: likelihoods from GT and GQ, calls of GQ >= {} kept as called", g.keep),
-        Some(_) => "; no PL or GL: likelihoods from GT and GQ".to_string(),
-        None => String::new(),
-    }
-}
+fn gq_note(gq: bool) -> &'static str { if gq { "; no PL or GL: likelihoods from GT and GQ" } else { "" } }
 
 /// The contigs (without `chr`) a VCF/BCF holds records on, from one pass over its records.
 pub fn covered_contigs(path: &str) -> std::io::Result<std::collections::HashSet<String>> {
@@ -733,7 +677,7 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&Bl
         buf.drain(..=cut);
     }
     let PlText { sample_names, body, gq } = parser.finish();
-    let Body { markers, gl3, n_variants_seen, n_missing_pl, haploid_samples, blocks, calls } = body;
+    let Body { markers, gl3, n_variants_seen, n_missing_pl, haploid_samples, blocks } = body;
 
     if sample_names.is_empty() {
         return Err(std::io::Error::other(format!("No samples in PL VCF {path}")));
@@ -749,7 +693,6 @@ pub fn parse_pl_vcf(path: &str, hash_alleles_against_srp: bool, keep: Option<&Bl
         sample_ids: sample_names,
         haploid_samples,
         blocks,
-        calls,
     })
 }
 
@@ -761,7 +704,6 @@ struct Body {
     n_missing_pl: usize,
     haploid_samples: Vec<bool>,
     blocks: RefBlocks,
-    calls: Vec<u8>, // a GT:GQ file's kept calls per (variant, sample), see PlVcfResult::calls
 }
 
 impl Body {
@@ -773,7 +715,6 @@ impl Body {
             n_missing_pl: 0,
             haploid_samples: vec![false; n_samples],
             blocks: RefBlocks::default(),
-            calls: Vec::new(),
         }
     }
 
@@ -785,14 +726,13 @@ impl Body {
         self.n_missing_pl += other.n_missing_pl;
         for (a, b) in self.haploid_samples.iter_mut().zip(other.haploid_samples) { *a |= b; }
         self.blocks.append(other.blocks);
-        self.calls.extend_from_slice(&other.calls);
     }
 }
 
 struct PlText {
     sample_names: Vec<String>,
     body: Body,
-    gq: Option<GqCalls>,
+    gq: bool,
 }
 
 /// Single-sample text after the `#CHROM` line is parsed in this many bytes per
@@ -818,25 +758,17 @@ struct PlTextParser<'a> {
     body: Body,
     hash: bool,
     keep: Option<&'a BlockSites<'a>>,
-    /// The `##FORMAT` ids of the header, and the GT:GQ mode they set at the `#CHROM` line.
+    /// The `##FORMAT` ids of the header, and the GT:GQ mode they set at the first `#CHROM` line.
     format_ids: Vec<String>,
-    gq: Option<GqCalls>,
-    /// A later header changed the sample count: no typed call is kept (`calls` would not align).
-    calls_off: bool,
+    gq: bool,
 }
 
 impl<'a> PlTextParser<'a> {
     fn new(hash: bool, keep: Option<&'a BlockSites<'a>>) -> Self {
-        PlTextParser { sample_names: Vec::new(), body: Body::new(0, 0), hash, keep, format_ids: Vec::new(), gq: None, calls_off: false }
+        PlTextParser { sample_names: Vec::new(), body: Body::new(0, 0), hash, keep, format_ids: Vec::new(), gq: false }
     }
 
-    fn finish(mut self) -> PlText {
-        if self.calls_off && self.gq.is_some() {
-            self.body.calls.clear();
-            crate::selphi_step!("{}", crate::log::yellow("the file's sample columns change along it: no typed call kept as called"));
-        }
-        PlText { sample_names: self.sample_names, body: self.body, gq: self.gq }
-    }
+    fn finish(self) -> PlText { PlText { sample_names: self.sample_names, body: self.body, gq: self.gq } }
 
     /// Parse `bytes`, whole lines (the last may lack its `\n` at the file's end).
     fn feed(&mut self, bytes: &[u8]) {
@@ -861,7 +793,7 @@ impl<'a> PlTextParser<'a> {
 
             if line.starts_with(b"#CHROM") {
                 // The first header decides, as the auto-route's sniff does.
-                if self.sample_names.is_empty() { self.gq = GqCalls::from_format_ids(self.format_ids.iter().map(String::as_str)); }
+                if self.sample_names.is_empty() { self.gq = gq_only_format(self.format_ids.iter().map(String::as_str)); }
                 let mut col = 0usize;
                 let mut start = 0usize;
                 let mut tmp_samples: Vec<String> = Vec::new();
@@ -877,7 +809,6 @@ impl<'a> PlTextParser<'a> {
                 if col >= 9 {
                     tmp_samples.push(std::str::from_utf8(&line[start..]).unwrap_or("").to_string());
                 }
-                self.calls_off |= !self.sample_names.is_empty() && tmp_samples.len() != self.sample_names.len();
                 self.sample_names = tmp_samples;
                 let n_samples = self.sample_names.len();
                 let rest = &bytes[cursor.min(bytes.len())..];
@@ -889,7 +820,6 @@ impl<'a> PlTextParser<'a> {
                 fresh.n_variants_seen = self.body.n_variants_seen;
                 fresh.n_missing_pl = self.body.n_missing_pl;
                 fresh.blocks = std::mem::take(&mut self.body.blocks);
-                fresh.calls = std::mem::take(&mut self.body.calls);
                 self.body = fresh;
                 if parallel_ok(rest, n_samples) {
                     self.parallel(rest);
@@ -928,7 +858,7 @@ impl<'a> PlTextParser<'a> {
 
 /// One VCF line after `#CHROM` (header and empty lines are skipped) → a record
 /// appended to `out`.
-fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bool, out: &mut Body, keep: Option<&BlockSites>, gq: Option<GqCalls>) {
+fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bool, out: &mut Body, keep: Option<&BlockSites>, gq: bool) {
     if line.is_empty() || line.starts_with(b"##") || n_samples == 0 { return; }
     // First 9 tab positions
     let mut tabs = [0usize; 9];
@@ -950,7 +880,6 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
     if pos < 1 { return; }
     let ref_bytes = &line[tabs[2]+1..tabs[3]];
     let alt_field = &line[tabs[3]+1..tabs[4]];
-    let gq = gq.map(|g| g.for_record(crate::io::target_io::filter_failed(&line[tabs[5]+1..tabs[6]])));
     // Several ALTs, a placeholder or none: the slow path, shared with the BCF reader.
     if alt_field.contains(&b',') || alt_field == b"." || alt_field.is_empty() || is_placeholder(alt_field) {
         let alts: Vec<&[u8]> = alt_field.split(|&b| b == b',').filter(|a| *a != b"." && !a.is_empty()).collect();
@@ -960,12 +889,12 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
         let format_bytes = &line[tabs[7]+1..tabs[8]];
         let (pl_i, gt_i, dp_i) = (find_format_subfield(format_bytes, b"PL"), find_format_subfield(format_bytes, b"GT"),
             find_format_subfield(format_bytes, b"DP"));
-        let gq_i = gq.and_then(|_| find_format_subfield(format_bytes, b"GQ"));
+        let gq_i = find_format_subfield(format_bytes, b"GQ").filter(|_| gq);
         let gl_i = find_format_subfield(format_bytes, b"GL");
         // Under --input-filter missing a filtered record keeps its sites with flat likelihoods.
         let filtered = crate::io::target_io::likelihoods_filter_missing() && crate::io::target_io::filter_failed(&line[tabs[5]+1..tabs[6]]);
         let fields: Vec<SampleFields> = line[tabs[8]+1..].split(|&b| b == b'\t').take(n_samples)
-            .map(|field| if gq.is_some() { no_cr(field) } else { field }).map(|field| if filtered { SampleFields::default() } else { SampleFields {
+            .map(|field| if gq { no_cr(field) } else { field }).map(|field| if filtered { SampleFields::default() } else { SampleFields {
             pl: pl_i.and_then(|i| extract_subfield(field, i)).filter(|p| *p != b".")
                 .and_then(|p| p.split(|&b| b == b',').map(|x| { let v = fast_parse_i32(x); (v >= 0).then_some(v) }).collect())
                 .or_else(|| gl_i.and_then(|i| extract_subfield(field, i)).and_then(parse_gl_text)),
@@ -975,7 +904,7 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
             rebuilt: false,
         }.with_gq_pl(gq, alts.len() + 1) }).collect();
         let r = SlowRecord { chrom: &line[..tabs[0]], pos, ref_bytes: &line[tabs[2]+1..tabs[3]], alts, end };
-        slow_record(&r, &fields, n_samples, hash_alleles_against_srp, on_contig(r.chrom, keep), gq, out);
+        slow_record(&r, &fields, n_samples, hash_alleles_against_srp, on_contig(r.chrom, keep), out);
         if let Some(k) = keep { keep_block(&r, &fields, n_samples, k, out); }
         return;
     }
@@ -988,8 +917,8 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
     let pl_pos = find_format_subfield(format_bytes, b"PL").filter(|_| !filtered);
     // Where PL is absent or missing, GL read as PL.
     let gl_pos = find_format_subfield(format_bytes, b"GL").filter(|_| !filtered);
-    // A GT:GQ file: the likelihoods each call stands for, and the call kept when sure (none filtered).
-    let gq_pos = gq.filter(|_| !filtered).and_then(|_| find_format_subfield(format_bytes, b"GT").zip(find_format_subfield(format_bytes, b"GQ")));
+    // A GT:GQ file: the likelihoods each call stands for (none for a filtered record under --input-filter missing).
+    let gq_pos = find_format_subfield(format_bytes, b"GT").zip(find_format_subfield(format_bytes, b"GQ")).filter(|_| gq && !filtered);
 
     // Allocate marker (one String triple per variant — unavoidable)
     let ref_allele = std::str::from_utf8(ref_bytes).unwrap_or("").to_string();
@@ -1028,15 +957,11 @@ fn parse_record_line(line: &[u8], n_samples: usize, hash_alleles_against_srp: bo
         // the BCF path via pl_to_hl_gl3 so both produce identical GLs.
         let pl_opt = pl_pos.and_then(|p| extract_subfield(field, p)).and_then(parse_pl_field)
             .or_else(|| gl_pos.and_then(|p| extract_subfield(field, p)).and_then(parse_gl_text).as_deref().and_then(pl_list_field));
-        let pl_opt = match gq {
-            Some(g) => {
-                let gt = gq_pos.and_then(|(i, _)| extract_subfield(no_cr(field), i)).map(parse_gt_text);
-                let q = gq_pos.and_then(|(_, i)| extract_subfield(no_cr(field), i)).map(fast_parse_i32).filter(|&q| q >= 0);
-                out.calls.push(if pl_opt.is_some() { NO_CALL } else { call_dose(gt.as_deref(), q, g.keep, 1, 2) });
-                pl_opt.or_else(|| gt.zip(q).and_then(|(gt, q)| gq_pl(&gt, q, 2)).as_deref().and_then(pl_list_field))
-            }
-            None => pl_opt,
-        };
+        let pl_opt = pl_opt.or_else(|| {
+            let gt = gq_pos.and_then(|(i, _)| extract_subfield(no_cr(field), i)).map(parse_gt_text)?;
+            let q = gq_pos.and_then(|(_, i)| extract_subfield(no_cr(field), i)).map(fast_parse_i32).filter(|&q| q >= 0)?;
+            gq_pl(&gt, q, 2).as_deref().and_then(pl_list_field)
+        });
         if here && pl_opt.is_some_and(|p| p.1) { out.haploid_samples[s] = true; }
         let (_, glp, valid) = pl_to_hl_gl3(pl_opt.map(|p| p.0));
         if !valid { out.n_missing_pl += 1; }
@@ -1169,12 +1094,6 @@ chr22\t500\t.\tA\tG\t50\t.\t.\tGT:PL\t0/1:30,0,30\n";
         assert_eq!(gq_pl(&gt(0, 0), 0, 2), None, "GQ 0 says nothing");
         assert_eq!(gq_pl(&[Some(0), None], 40, 2), None);
         assert_eq!(gq_pl(&gt(0, 2), 40, 2), None, "an allele the record lacks");
-        assert_eq!(call_dose(Some(&gt(0, 1)), Some(50), 50, 1, 2), 1);
-        assert_eq!(call_dose(Some(&gt(1, 2)), Some(60), 50, 2, 3), 1);
-        assert_eq!(call_dose(Some(&gt(0, 2)), Some(99), 50, 1, 2), NO_CALL, "an allele the record lacks");
-        assert_eq!(call_dose(Some(&gt(1, 1)), Some(49), 50, 1, 2), NO_CALL);
-        assert_eq!(call_dose(Some(&gt(1, 1)), Some(99), 0, 1, 2), NO_CALL, "keep 0: none kept");
-        assert_eq!(call_dose(Some(&[Some(1)]), Some(99), 50, 1, 2), NO_CALL, "haploid calls are not kept");
     }
 
     #[test]
@@ -1192,17 +1111,10 @@ chr22\t500\t.\tA\tG\t50\t.\t.\tGT:PL\t0/1:30,0,30\n";
         assert_eq!(&t.body.gl3[9..12], &FLAT_GL3[..], "./. is flat");
         assert_eq!(&t.body.gl3[12..15], &gl([115, 0, 0])[..], "T of 1/2: 0/0 0/2 2/2 = 135,20,20");
         assert_eq!(&t.body.gl3[18..21], &gl([255, 99, 0])[..], "a filtered record's likelihoods are read");
-        // Per (marker, sample), GQ >= 50 only; none of a filtered record (--input-filter auto).
-        assert_eq!(t.body.calls, vec![NO_CALL, 1, NO_CALL, NO_CALL, NO_CALL, NO_CALL, NO_CALL, NO_CALL]);
-        // CRLF lines: the last column's GQ is read; a record with its own PL keeps no call.
+        // CRLF lines: the last column's GQ is read; a record's own PL comes first.
         let crlf = format!("{head}{body}").replacen("GT:GQ\t0/0:30\t0/1:60\n", "GT:GQ:PL\t0/0:80:0,5,9\t0/1:60:.\r\n", 1);
         let c = parse_pl_text(crlf.as_bytes(), false, None);
         assert_eq!(&c.body.gl3[0..6], &[gl([0, 5, 9]), gl([60, 0, 60])].concat()[..]);
-        assert_eq!(&c.body.calls[0..2], &[NO_CALL, 1]);
-        assert_eq!(c.body.calls.len(), 8);
-        // A second header with another sample count: no call kept (they would not align).
-        let two = format!("{head}{body}#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n22\t500\t.\tA\tG\t.\tPASS\t.\tGT:GQ\t1/1:99\n");
-        assert!(parse_pl_text(two.as_bytes(), false, None).body.calls.is_empty());
         // A reference block without DP: the likelihoods its GQ stands for.
         let block = format!("{head}{body}22\t400\t.\tA\t.\t.\tPASS\tEND=450\tGT:GQ\t0/0:20\t0/0:.\n");
         let positions = [420i64];
@@ -1210,10 +1122,9 @@ chr22\t500\t.\tA\tG\t50\t.\t.\tGT:PL\t0/1:30,0,30\n";
         assert_eq!((b.start, b.end), (vec![400], vec![450]));
         assert_eq!(&b.gl3[0..3], &gl([0, 20, 135])[..]);
         assert_eq!(&b.gl3[3..6], &FLAT_GL3[..]);
-        // The same records under a header that declares PL are read as before: no PL, flat, no calls.
+        // The same records under a header that declares PL are read as before: no PL, flat.
         let pl_head = head.replace("ID=GQ", "ID=PL");
         let t = parse_pl_text(format!("{pl_head}{body}").as_bytes(), false, None);
-        assert!(t.body.calls.is_empty());
         assert!(t.body.gl3.iter().all(|&g| g == 1.0 / 3.0));
     }
 
