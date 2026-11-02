@@ -184,6 +184,15 @@ impl LcwgsParams {
         let ed = self.epsilon.max(self.novel_emission);
         (1.0 - ed, ed)
     }
+
+    /// The parameters of a `--calls` run: the novel-allele emission stays off unless
+    /// `LCWGS_NOVEL_EMISSION` is set. The rows `--calls` hands over are a caller's no-calls and
+    /// low-GQ calls, where the reads are the ambiguous ones; with 1e-6 the merge lost net calls on
+    /// the 13 fresh v4 sets (SNP 5251 -> 5125, indel 903 -> 890; chr22 development SNP 368 -> 356).
+    pub fn for_calls(&self) -> Self {
+        let novel_emission = if std::env::var_os("LCWGS_NOVEL_EMISSION").is_some() { self.novel_emission } else { 0.0 };
+        Self { novel_emission, ..self.clone() }
+    }
 }
 
 impl Default for LcwgsParams {

@@ -233,6 +233,7 @@ fn log_start(args: &CallsArgs, header: &header::CallsHeader, reads_sample: &str)
 pub fn run_single(args: &CallsArgs, prep: Prepared, params: &LcwgsParams, srp: &SrpReader, map: &str,
     region: Option<(&str, i64, i64)>) -> std::io::Result<()> {
     let Prepared { header, lines, reads_sample } = prep;
+    let params = &params.for_calls();
     let header = &header;
     log_start(args, header, &reads_sample);
     let chrom = srp.chromosome();
@@ -284,6 +285,7 @@ pub fn run_single(args: &CallsArgs, prep: Prepared, params: &LcwgsParams, srp: &
 /// records written as read.
 pub fn run_multi(args: &CallsArgs, prep: Prepared, params: &LcwgsParams, set: &PanelSet) -> std::io::Result<()> {
     let Prepared { header, lines, reads_sample } = prep;
+    let params = &params.for_calls();
     let header = &header;
     log_start(args, header, &reads_sample);
     let fasta = fasta_contigs(args.reference)?;

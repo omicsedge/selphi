@@ -878,3 +878,12 @@ fn output_bytes_do_not_depend_on_writer_threads() {
     crate::common::threads::refusing(|| f.run_text(pol(), &text)).unwrap();
     assert_eq!(read(), threads);
 }
+
+/// `--calls` keeps the novel-allele emission off unless `LCWGS_NOVEL_EMISSION` is set.
+#[test]
+fn calls_runs_keep_the_novel_allele_emission_off() {
+    if std::env::var_os("LCWGS_NOVEL_EMISSION").is_some() { return; }
+    let p = crate::lcwgs::LcwgsParams::default();
+    assert!(p.novel_emission > p.epsilon);
+    assert_eq!(p.for_calls().output_emission(), (1.0 - p.epsilon, p.epsilon));
+}
