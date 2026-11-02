@@ -350,6 +350,16 @@ fn parse_gt_text(g: &[u8]) -> Vec<Option<u32>> {
     g.split(|&b| b == b'/' || b == b'|').map(|a| std::str::from_utf8(a).ok()?.parse::<u32>().ok()).collect()
 }
 
+/// A GT:GQ sample's likelihoods for ALT `k` of a record split into one marker per ALT: its call
+/// projected on `k` (copies of `k` against any other allele), rebuilt with [`gq_pl`], so a `1/2` keeps
+/// its confidence at each ALT where the subset of the whole rebuilt `PL` would not.
+fn gq_split_pl(f: &SampleFields, k: usize, n_alleles: usize) -> Option<([i32; 3], bool)> {
+    let gt = f.gt.as_deref()?;
+    if gt.iter().flatten().any(|&a| a as usize >= n_alleles) { return None; }
+    let gt: Vec<Option<u32>> = gt.iter().map(|a| a.map(|x| u32::from(x as usize == k))).collect();
+    gq_pl(&gt, f.gq?, 2).as_deref().and_then(pl_list_field)
+}
+
 /// One sample's fields of a record read by the slow path.
 #[derive(Default)]
 struct SampleFields { pl: Option<Vec<i32>>, gt: Option<Vec<Option<u32>>>, dp: Option<i32>, gq: Option<i32>, rebuilt: bool }
@@ -547,7 +557,7 @@ fn slow_record(r: &SlowRecord, fields: &[SampleFields], n_samples: usize, hash: 
         let gl_off = out.gl3.len();
         out.gl3.resize(gl_off + n_samples * 3, 1.0 / 3.0);
         for s in 0..n_samples {
-            let pl = fields.get(s).and_then(|f| f.pl.as_deref()).and_then(|p| pl_subset(p, n_alleles, k));
+            let pl = fields.get(s).and_then(|f| if f.rebuilt { gq_split_pl(f, k, n_alleles) } else { f.pl.as_deref().and_then(|p| pl_subset(p, n_alleles, k)) });
             if here && pl.is_some_and(|p| p.1) { out.haploid_samples[s] = true; }
             let (_, glp, valid) = pl_to_hl_gl3(pl.map(|p| p.0));
             if !valid { out.n_missing_pl += 1; }
@@ -1107,9 +1117,9 @@ chr22\t500\t.\tA\tG\t50\t.\t.\tGT:PL\t0/1:30,0,30\n";
         let t = parse_pl_text(format!("{head}{body}").as_bytes(), false, None);
         let gl = |pl: [i32; 3]| pl_to_hl_gl3(Some(pl)).1;
         assert_eq!(&t.body.gl3[0..6], &[gl([0, 30, 202]), gl([60, 0, 60])].concat()[..]);
-        assert_eq!(&t.body.gl3[6..9], &gl([115, 0, 0])[..], "C of 1/2: 0/0 0/1 1/1 = 135,20,20 relative to 20");
+        assert_eq!(&t.body.gl3[6..9], &gl([20, 0, 20])[..], "1/2 is a het at C (the call projected on C)");
         assert_eq!(&t.body.gl3[9..12], &FLAT_GL3[..], "./. is flat");
-        assert_eq!(&t.body.gl3[12..15], &gl([115, 0, 0])[..], "T of 1/2: 0/0 0/2 2/2 = 135,20,20");
+        assert_eq!(&t.body.gl3[12..15], &gl([20, 0, 20])[..], "and a het at T");
         assert_eq!(&t.body.gl3[18..21], &gl([255, 99, 0])[..], "a filtered record's likelihoods are read");
         // CRLF lines: the last column's GQ is read; a record's own PL comes first.
         let crlf = format!("{head}{body}").replacen("GT:GQ\t0/0:30\t0/1:60\n", "GT:GQ:PL\t0/0:80:0,5,9\t0/1:60:.\r\n", 1);

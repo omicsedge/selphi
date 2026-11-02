@@ -372,7 +372,8 @@ fn passenger_dose<F: Fn(usize) -> usize>(
     if cond.is_empty() { return vec![0.5; n_pass]; }
     let n_var = cm.len();
     let row0 = ref_bm.n_sites;
-    let (ee, ed) = (1.0f32 - params.epsilon, params.epsilon);
+    // The dose of a passenger no conditioning hap carries is folded as every site's is.
+    let (ee, ed) = params.output_emission();
     let mut dose = vec![0.0f32; n_pass];
     let mut poly: Vec<usize> = Vec::new();
     super::membership::with_membership(ref_bm.n_haps, |in_cond| {
@@ -2812,10 +2813,11 @@ mod tests {
         let mut rng = rp::Xs(0xA54F_F53A_5F1D_36F1);
         let configs: &[(usize, usize, usize, bool)] = &[(300, 160, 60, false), (180, 900, 40, false), (120, 64, 120, false),
             (400, 5000, 150, false), (200, 300, 80, true), (250, 5000, 100, true)];
-        for &(n_var, n_haps, n_pass, plateau) in configs {
+        for (i, &(n_var, n_haps, n_pass, plateau)) in configs.iter().enumerate() {
             let (full, cm, ins, pcm, gl3) = passenger_fixture(&mut rng, n_var, n_haps, 1, n_pass, false, plateau);
             let bm = HaplotypeBitmatrix::from_subset(&full, &(0..n_var + n_pass).collect::<Vec<_>>()).with_hidden_tail(n_var);
-            let params = LcwgsParams::default();
+            // Every other config with a novel-allele emission the tolerance below cannot hide.
+            let params = LcwgsParams { novel_emission: [1e-6, 1e-4][i % 2], ..Default::default() };
             let model = PassengerModel::build(&bm, n_pass, &params);
             assert!(model.carriers.iter().any(|c| !c.is_empty()) || n_haps < 1000, "no rare passenger exercised");
             let pass = ChunkPassengers { ins: ins.clone(), cm: &pcm };
