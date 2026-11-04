@@ -175,7 +175,7 @@ pub(crate) struct Links {
 /// observation, and 12 B of offsets per entry (<= one per fragment).
 fn plan_bytes(frags: usize, obs: usize) -> usize { 260 * obs + 12 * frags }
 
-/// Whether this run links read pairs: asked for (`LCWGS_LINKAGE`), and neither with
+/// Whether this run links read pairs: not turned off (`LCWGS_LINKAGE`), and neither with
 /// the scaffold forward-backward or the heuristic phaser, nor on a biobank-size
 /// panel (whose SPLIT passes were not measured with it).
 fn link_config(n_ref: usize, params: &LcwgsParams) -> Option<super::linkage::LinkConfig> {
@@ -188,8 +188,8 @@ fn link_config(n_ref: usize, params: &LcwgsParams) -> Option<super::linkage::Lin
         crate::selphi_info!("  lcWGS read-pair linkage: off ({why})");
         return None;
     }
-    crate::selphi_info!("  lcWGS read-pair linkage: forward-backward and phaser at sites of panel MAF >= {} (minor-allele bases below), the first {} bases of a site, samples of median depth <= {}",
-        cfg.min_maf, super::linkage::MAX_SLOTS, cfg.max_depth);
+    crate::selphi_info!("  lcWGS read-pair linkage: forward-backward and phaser at sites of panel MAF >= {} (minor-allele bases below), the first {} bases of a site of at most {}, samples of median depth <= {} (LCWGS_LINKAGE=0: off)",
+        cfg.min_maf, super::linkage::MAX_SLOTS, cfg.site_max_depth, cfg.max_depth);
     Some(cfg)
 }
 
@@ -1808,7 +1808,7 @@ fn run_chunked_gibbs(
                 let linkable = super::linkage::view::linkable_sites(&chunk_bm, l.cfg.min_maf);
                 let mut gl_fb = chunk_gl3.to_vec();
                 let views: Vec<Option<super::linkage::view::ChunkLinks>> = l.samples.iter().enumerate().map(|(s, link)| link.as_ref().map(|link| {
-                    let (view, rest) = super::linkage::view::build(link, buf_start..buf_end, &linkable, errmod.as_ref().unwrap(), params.epsilon);
+                    let (view, rest) = super::linkage::view::build(link, buf_start..buf_end, &linkable, errmod.as_ref().unwrap(), params.epsilon, l.cfg.site_max_depth);
                     for (v, gl) in rest { let b = (v as usize * n_samples + s) * 3; gl_fb[b..b + 3].copy_from_slice(&gl); }
                     view
                 })).collect();

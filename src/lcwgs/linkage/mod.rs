@@ -31,9 +31,13 @@
 //! joint mass over the shared state); the phaser's potentials do not reach a linked
 //! heterozygote that its conditioning set leaves monomorphic (placed as before).
 //!
-//! Opt-in (`LCWGS_LINKAGE`): on the held-out sets it raised overall R2 at 0.5-2x but
-//! did not pass the acceptance margins on ultra-rare and 0.5-1% sites or capture
-//! libraries (2026-10-31).
+//! A site holding more than [`LinkConfig::site_max_depth`] bases in a sample is not
+//! linked there: errmod keeps all its bases, with their correlated-error weights, which
+//! the one-base terms of a linked base lack. Without that cap, linking deep sites cost
+//! rare-variant R2 at 2x and heterozygote precision on capture libraries.
+//!
+//! On by default (`LCWGS_LINKAGE=0` turns it off, the previous output): 2026-11-04,
+//! nine held-out sets x 3 seeds, overall R2 +0.0012 / +0.0008 / +0.0004 at 0.5 / 1 / 2x.
 
 pub(crate) mod assemble;
 pub(crate) mod phase;
@@ -60,18 +64,27 @@ pub struct LinkConfig {
     /// linked (`LCWGS_LINK_MAX_DEPTH`, default 3: at true 4x the held-out sets gained
     /// nothing overall).
     pub max_depth: usize,
+    /// A site holding more bases than this in a sample is not linked there: its bases
+    /// all stay in errmod (`LCWGS_LINK_SITE_MAX_DEPTH`, default 3).
+    pub site_max_depth: usize,
 }
 
 impl LinkConfig {
-    /// The run's setting from `LCWGS_LINKAGE` (opt-in), `None` when unset, empty or
-    /// off. `rare_maf` bounds the site floor from below.
+    /// The run's setting: on unless `LCWGS_LINKAGE` turns it off. `rare_maf` bounds the
+    /// site floor from below.
     pub fn from_env(rare_maf: f32) -> Option<Self> {
-        let mode = crate::config::raw("LCWGS_LINKAGE")?.trim().to_ascii_lowercase();
-        if matches!(mode.as_str(), "" | "0" | "off" | "false" | "no" | "n") { return None; }
+        if !enabled(crate::config::raw("LCWGS_LINKAGE").as_deref()) { return None; }
         let min_maf = crate::config::f32_or("LCWGS_LINK_MIN_MAF", 0.01).max(rare_maf);
         let max_depth = crate::config::usize_or("LCWGS_LINK_MAX_DEPTH", 3);
-        Some(LinkConfig { min_maf, max_depth })
+        let site_max_depth = crate::config::usize_or("LCWGS_LINK_SITE_MAX_DEPTH", 3);
+        Some(LinkConfig { min_maf, max_depth, site_max_depth })
     }
+}
+
+/// `LCWGS_LINKAGE`: off for 0, off, false, no or n (any case); on when unset, empty (as
+/// `--config` reads an empty value) or anything else.
+fn enabled(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no" | "n"))
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,3 +113,15 @@ pub(crate) fn count_moves(accepted: bool) {
 
 /// Read and reset the run totals (see [`STATS`]).
 pub(crate) fn take_stats() -> [u64; 8] { std::array::from_fn(|i| STATS[i].swap(0, Ordering::Relaxed)) }
+
+#[cfg(test)]
+mod tests {
+    use super::enabled;
+
+    /// On unless turned off; an empty value is the default, as `--config` reads it.
+    #[test]
+    fn linkage_is_on_unless_turned_off() {
+        for v in [None, Some(""), Some("1"), Some("on"), Some(" yes ")] { assert!(enabled(v), "{v:?}"); }
+        for v in ["0", "off", "OFF", "false", "no", "n", " 0 "] { assert!(!enabled(Some(v)), "{v}"); }
+    }
+}

@@ -83,9 +83,12 @@ fn base_terms(o: u16, eps: f64) -> [f64; 2] {
 /// none is left), as `(chunk-local site, gl3)` ascending. `eps`: the copying error.
 pub(crate) fn build(
     link: &SampleLinkage, buf: std::ops::Range<usize>, linkable: &[Linkable], em: &crate::lcwgs::errmod::ErrMod, eps: f32,
+    site_max_depth: usize,
 ) -> (ChunkLinks, Vec<(u32, [f32; 3])>) {
     debug_assert_eq!(linkable.len(), buf.len());
     let (lo, hi) = (buf.start as u32, buf.end as u32);
+    // Sites deeper than the cap are not linked: errmod keeps all their bases.
+    let shallow: Vec<bool> = (lo..hi).map(|v| link.kept_at(v).map_or(true, |(b, _, _)| b.len() <= site_max_depth)).collect();
     let first = |f: usize| link.site[link.frag_off[f] as usize];
     // The first fragment that can reach the buffer (fragments are sorted by first site).
     let (mut f, mut b) = (0usize, link.n_frag());
@@ -104,7 +107,7 @@ pub(crate) fn build(
         let mut n = 0usize;
         for i in r.clone() {
             let v = link.site[i];
-            if v < lo || v >= hi || !linkable[(v - lo) as usize].takes(link.obs[i]) { continue; }
+            if v < lo || v >= hi || !shallow[(v - lo) as usize] || !linkable[(v - lo) as usize].takes(link.obs[i]) { continue; }
             let local = v - lo;
             if sites.len() == start || *sites.last().unwrap() != local {
                 if n == super::MAX_SITES { break; }
@@ -120,7 +123,7 @@ pub(crate) fn build(
             let kept = &sites[start..];
             for i in r {
                 let v = link.site[i];
-                if v >= lo && v < hi && linkable[(v - lo) as usize].takes(link.obs[i]) && kept.binary_search(&(v - lo)).is_ok() {
+                if v >= lo && v < hi && shallow[(v - lo) as usize] && linkable[(v - lo) as usize].takes(link.obs[i]) && kept.binary_search(&(v - lo)).is_ok() {
                     linked.push((v - lo, link.obs[i] & PACKED));
                 }
             }
@@ -208,13 +211,13 @@ mod tests {
         // (rare site whose minor allele is REF: f1 reads ALT there).
         let buf = 3..21;
         let linkable: Vec<Linkable> = (3..21).map(|v| if v == 9 { Linkable::Minor(false) } else { Linkable::Any }).collect();
-        let (view, rest) = build(&link, buf, &linkable, &em, 0.0);
+        let (view, rest) = build(&link, buf, &linkable, &em, 0.0, usize::MAX);
         // f1 keeps sites 3, 4 (local 0, 1); f2 keeps local 7..=14; f3 is outside.
         assert_eq!(view.n_frag(), 2);
         assert_eq!(view.frag(0).0, &[0, 1]);
         // With ALT minor at site 9, f1's ALT base there is linked too.
         let minor_alt: Vec<Linkable> = (3..21).map(|v| if v == 9 { Linkable::Minor(true) } else { Linkable::Any }).collect();
-        assert_eq!(build(&link, 3..21, &minor_alt, &em, 0.0).0.frag(0).0, &[0, 1, 6]);
+        assert_eq!(build(&link, 3..21, &minor_alt, &em, 0.0, usize::MAX).0.frag(0).0, &[0, 1, 6]);
         assert_eq!(view.frag(1).0, &(7..15).collect::<Vec<u32>>()[..]);
         // Site 4's two REF bases multiply: REF term 1, ALT term 10^-3 * 10^-2.
         let lu = view.frag(0).1[1];
@@ -226,5 +229,13 @@ mod tests {
         let mut one = vec![p(35, 1, 0)];
         let want = crate::lcwgs::bam_pileup::errmod_gl3(&em, &mut one, 0, 2, false).unwrap();
         for r in &rest { assert_eq!(r.1, want); }
+        // Site cap 2: site 4 holds three bases, so f1 keeps one site (3) and is not linked;
+        // f2's sites hold two bases each and stay linked. Cap 1: nothing is linked.
+        let (capped, rest2) = build(&link, 3..21, &linkable, &em, 0.0, 2);
+        assert_eq!(capped.n_frag(), 1);
+        assert_eq!(capped.frag(0).0, &(7..15).collect::<Vec<u32>>()[..]);
+        assert_eq!(rest2.iter().map(|r| r.0).collect::<Vec<u32>>(), (7..15).collect::<Vec<u32>>());
+        let (none, rest1) = build(&link, 3..21, &linkable, &em, 0.0, 1);
+        assert_eq!((none.n_frag(), rest1.len()), (0, 0));
     }
 }
