@@ -77,9 +77,9 @@ what it chose. The result is `imputed.vcf.gz` with its index. Three real runs, r
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/pipeline_dark.svg"/>
-    <source media="(prefers-color-scheme: light)" srcset="img/pipeline_light.svg"/>
-    <img src="img/pipeline_light.svg" alt="Three real runs replayed line by line (an array cohort phased and imputed, WGS samples phased only, a low-coverage BAM imputed), with the pipeline diagram lighting up each stage as its log line appears" width="900"/>
+    <source media="(prefers-color-scheme: dark)" srcset="img/demo_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/demo_light.svg"/>
+    <img src="img/demo_light.svg" alt="Three real runs replayed line by line in a terminal: an array cohort phased and imputed, WGS samples phased only, a low-coverage BAM imputed" width="900"/>
   </picture>
 </p>
 

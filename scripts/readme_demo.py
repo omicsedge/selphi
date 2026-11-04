@@ -1,12 +1,11 @@
-"""Animated pipeline demo for the README (img/pipeline_{dark,light}.svg).
+"""Animated demo for the README (img/demo_{dark,light}.svg).
 
-Replays real Selphi runs in a terminal window above the pipeline diagram. Each
+Replays real Selphi runs in a terminal window. Each
 scenario directory holds `cmd.txt` (the typed command, one row per line) and
 `ansi.txt` (the terminal output captured with `script -qfec`; scripts/readme_demo_capture.sh). Log lines are
 shown verbatim with the colours Selphi printed; long lines wrap as a terminal
 wraps them. Only the pacing is compressed: the pause before a line grows with
-the square root of the real time it took, capped. Diagram boxes light up when
-the log line that reports their stage appears.
+the square root of the real time it took, capped.
 
 Built by scripts/readme_figures.py --demo DIR.
 """
@@ -23,9 +22,7 @@ ROWS, LH, FS = 22, 17, 12.5   # visible rows, line height, font size
 MAXC = 112                    # wrap width in characters
 Y0 = TY + BAR + 12            # top of the text viewport
 TH = BAR + 12 + ROWS * LH + 14
-AY = TY + TH + 14             # top of the architecture diagram
-AH = 800
-H = AY + AH
+H = TY + TH + 10
 
 MONO = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace"
 SANS = "'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif"
@@ -35,53 +32,13 @@ TERM = dict(bg="#0d1117", border="#30363d", rule="#21262d", fg="#c9d1d9", bold="
             prompt="#7ee787", label="#8b949e")
 ANSI_FG = {"31": "#ff7b72", "32": "#7ee787", "33": "#e3b341", "36": "#56d4dd"}
 
-ARCH = {
-    "dark": dict(bg="#0d1117", box="#0d1117", g0="#1c2333", g1="#161b22", title="#e6edf3", text="#c9d1d9",
-                 muted="#8b949e", arrow="#8b949e", opt="#6e7681",
-                 green="#7ee787", green_s="#238636", amber="#d29922", purple="#a78bfa", purple_s="#8b5cf6",
-                 blue="#58a6ff", blue_s="#1f6feb", orange="#fb923c", orange_s="#f97316", dblue="#60a5fa",
-                 dblue_s="#3b82f6", pink="#f472b6", pink_s="#ec4899", pink_t="#f9a8d4", teal="#5eead4",
-                 teal_s="#2dd4bf", hl_green="#16a34a", hl_purple="#8b5cf6", hl_blue="#2563eb",
-                 hl_pink="#db2777", hl_teal="#0d9488", hl_amber="#d29922", hl_grey="#8b949e", dim_op="0.72"),
-    "light": dict(bg="#ffffff", box="#ffffff", g0="#f6f8fa", g1="#eef1f5", title="#1f2328", text="#1f2328",
-                  muted="#57606a", arrow="#57606a", opt="#8c959f",
-                  green="#1a7f37", green_s="#1a7f37", amber="#9a6700", purple="#8250df", purple_s="#8250df",
-                  blue="#0969da", blue_s="#0969da", orange="#bc4c00", orange_s="#d9730d", dblue="#0969da",
-                  dblue_s="#0969da", pink="#bf3989", pink_s="#bf3989", pink_t="#a81b6b", teal="#0f766e",
-                  teal_s="#0d9488", hl_green="#1a7f37", hl_purple="#8250df", hl_blue="#0969da",
-                  hl_pink="#bf3989", hl_teal="#0d9488", hl_amber="#9a6700", hl_grey="#57606a", dim_op="0.75"),
-}
+PAGE_BG = {"dark": "#0d1117", "light": "#ffffff"}   # around the terminal, which is dark in both themes
 
-# Diagram boxes: id -> (x, y, w, h, rx) in diagram coordinates, highlight colour key.
-BOX = {
-    "input":     ((30, 50, 195, 50, 8), "hl_green"),
-    "reference": ((248, 50, 195, 50, 8), "hl_amber"),
-    "map":       ((466, 50, 195, 50, 8), "hl_grey"),
-    "bitmatrix": ((60, 132, 640, 38, 10), "hl_purple"),
-    "phasing":   ((49, 197, 822, 202, 10), "hl_blue"),
-    "diploid":   ((70, 250, 780, 136, 8), "hl_blue"),
-    "handoff":   ((140, 414, 640, 28, 8), "hl_green"),
-    "genotype":  ((70, 512, 380, 124, 8), "hl_pink"),
-    "lcwgs":     ((470, 512, 380, 124, 8), "hl_teal"),
-    "output":    ((50, 690, 820, 54, 10), "hl_green"),
-}
-
-# Scenarios: label, (regex -> box) highlight triggers, boxes dimmed for the whole scenario.
+# Scenarios: directory, label.
 SCENARIOS = [
-    ("chip", "chip array  →  phase + impute",
-     [(r"Target: ", "input"), (r"Loaded SRP", "reference"), (r"Ref bitmatrix extracted", "bitmatrix"),
-      (r"Using Diploid phasing", "diploid"), (r"Phasing complete:", "handoff"),
-      (r"Genetic map loaded", "map"), (r"PBWT sort|Window \d", "genotype"), (r"Output: ", "output")],
-     ["lcwgs"]),
-    ("wgs", "WGS  →  phase only",
-     [(r"Target: ", "input"), (r"Loaded SRP", "reference"), (r"Genetic map|map loaded", "map"),
-      (r"[Bb]itmatrix|Common ref subset", "bitmatrix"), (r"Diploid", "diploid"),
-      (r"[Pp]hased output|Output: |Writing", "output")],
-     ["handoff", "genotype", "lcwgs"]),
-    ("lowcov", "low-coverage reads (BAM)  →  lcWGS",
-     [(r"auto-route", "input"), (r"SRP|panel", "reference"), (r"[Mm]ap", "map"),
-      (r"pileup|BAQ|Gibbs|chunk", "lcwgs"), (r"lowcov\.vcf\.gz|Output|done", "output")],
-     ["phasing", "handoff", "genotype"]),
+    ("chip", "chip array  →  phase + impute"),
+    ("wgs", "WGS  →  phase only"),
+    ("lowcov", "low-coverage reads (BAM)  →  lcWGS"),
 ]
 
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
@@ -217,7 +174,7 @@ class Timeline:
                 f'repeatCount="indefinite"/')
 
 
-def build_scenario(d, label, triggers, dims, tl, t0, out_term, out_hl, out_dim, A):
+def build_scenario(d, label, tl, t0, out_term):
     cmd = [l.rstrip("\n") for l in open(os.path.join(d, "cmd.txt"))]
     lines = read_log(os.path.join(d, "ansi.txt"))
     real = line_times(lines)
@@ -293,139 +250,32 @@ def build_scenario(d, label, triggers, dims, tl, t0, out_term, out_hl, out_dim, 
                      f'dur="1s" repeatCount="indefinite"/></rect>')
     g.append('</g></g></g>')
     out_term.append("\n".join(x for x in g if x))
-
-    # ---- diagram highlights and dimming ----
-    for pat, box in triggers:
-        rx = re.compile(pat)
-        hit = next((a for a, l in zip(appear, lines) if rx.search(SGR.sub("", l))), None)
-        if hit is None:
-            continue
-        (x, y, w, h, r), ck = BOX[box]
-        out_hl.append(_hl_rect(x, y, w, h, r, A[ck], tl.show(hit, t_end)))
-    for box in dims:
-        (x, y, w, h, r), _ = BOX[box]
-        out_dim.append(_dim_rect(x, y, w, h, r, A["bg"], tl.show(t0, t_end, on=A["dim_op"])))
     return t_end
 
 
-def _hl_rect(x, y, w, h, r, col, show):
-    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{r}" fill="none" stroke="{col}" stroke-width="3" {show}></rect>'
-
-
-def _dim_rect(x, y, w, h, r, col, show):
-    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{r}" fill="{col}" {show}></rect>'
-
-
-def arch(A):
-    """Static pipeline diagram (labels follow the manuscript's Figure 1)."""
-    o = []
-    T = lambda x, y, s, fill, size=11.5, weight=None, italic=False, anchor="middle": o.append(
-        f'<text x="{x}" y="{y}" text-anchor="{anchor}" fill="{fill}" font-size="{size}"'
-        + (f' font-weight="{weight}"' if weight else "") + (' font-style="italic"' if italic else "")
-        + f'>{esc(s)}</text>')
-    R = lambda x, y, w, h, rx, stroke, sw=1.5, fill=None, dash=None, filt=False: o.append(
-        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" fill="{fill or A["box"]}" stroke="{stroke}" stroke-width="{sw}"'
-        + (f' stroke-dasharray="{dash}"' if dash else "") + '/>')
-    L = lambda x1, y1, x2, y2: o.append(
-        f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{A["arrow"]}" stroke-width="1.2" marker-end="url(#arr)"/>')
-
-    T(460, 30, "Selphi 2 — pipeline", A["title"], 18, "600")
-    for (x, w, head, body, col, dash) in [
-            (30, 195, "TARGET", "VCF / BCF / BAM / CRAM", "green", None),
-            (248, 195, "REFERENCE PANEL", "SRP (one or all chromosomes)", "amber", None),
-            (466, 195, "GENETIC MAP", "PLINK format", "muted", None),
-            (684, 205, "OPTIONAL", "Pedigree (PED)", "opt", "4,3")]:
-        R(x, 50, w, 50, 8, A[col if col != "green" else "green_s"], 1.5 if not dash else 1, dash=dash)
-        T(x + w / 2, 71, head, A[col], 11, "600")
-        T(x + w / 2, 88, body, A["text"] if not dash else A["muted"], 12.5)
-    L(128, 100, 128, 130); L(346, 100, 346, 130)
-    R(60, 132, 640, 38, 10, A["purple_s"], fill="url(#sg)")
-    T(380, 149, "Panel held as a bit matrix", A["purple"], 12, "700")
-    T(380, 164, "1 bit per allele, shared by phasing and imputation", A["muted"], 11)
-    L(380, 170, 380, 196)
-
-    R(50, 198, 820, 200, 10, A["blue_s"], fill="url(#sg)")
-    T(460, 220, "Phasing", A["blue"], 14, "700")
-    T(460, 237, "genotype engine only; a phased input is re-phased and may keep its own phase as one of two (--keep-input-phase skips this)", A["muted"], 11)
-    R(70, 250, 780, 136, 8, A["dblue_s"], 1.2)
-    T(460, 272, "Diploid engine", A["dblue"], 13, "700")
-    for i, s in enumerate(["Genotype graph: up to 8 configurations per segment", "Segment HMM on PBWT neighbours, sampled by MCMC", "Replicas: 2-3 copies per sample in eligible runs"]):
-        T(265, 302 + 22 * i, s, A["text"])
-    for i, s in enumerate(["Common sites first, rare sites on that scaffold", "Ancestry check for long-range phase errors", "Trios and duos with --ped"]):
-        T(655, 302 + 22 * i, s, A["text"])
-    T(460, 377, "arrays, WGS, and cohorts phased without a panel (--phase-panel)", A["muted"], 10, italic=True)
-    o.append(f'<path d="M787 100 L787 186 L895 186 L895 318 L872 318" fill="none" stroke="{A["opt"]}" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>')
-    o.append(f'<text x="905" y="252" fill="{A["opt"]}" font-size="9" transform="rotate(90,905,252)" text-anchor="middle">Mendelian scaffold</text>')
-    o.append(f'<path d="M 28 100 L 12 100 L 12 548 L 48 548" fill="none" stroke="{A["blue"]}" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>')
-    o.append(f'<text x="5" y="324" fill="{A["blue"]}" font-size="10" font-weight="600" transform="rotate(-90,5,324)" text-anchor="middle">--keep-input-phase → skip</text>')
-    L(460, 398, 460, 412)
-    R(140, 414, 640, 28, 8, A["green_s"], 1, dash="6,3")
-    T(460, 432, "Phased haplotypes passed on in memory (no intermediate files)", A["green"], 11)
-    L(460, 442, 460, 458)
-
-    R(50, 460, 820, 214, 10, A["pink_s"], fill="url(#sg)")
-    T(460, 482, "Imputation", A["pink"], 14, "700")
-    T(460, 499, "engine chosen from the input: genotypes → genotype engine · likelihoods or aligned reads → low-coverage engine", A["muted"], 11)
-    R(70, 512, 380, 124, 8, A["pink_s"], 1.2)
-    T(260, 533, "Genotype imputation", A["pink_t"], 13, "700")
-    T(260, 549, "arrays and sequencing calls", A["muted"], 10)
-    for i, s in enumerate(["PBWT selects candidate haplotypes", "Li-Stephens HMM over the typed sites",
-                           "Weights interpolated in cM to every panel site"]):
-        T(260, 569 + 18 * i, s, A["text"])
-    T(260, 627, "calls in → GT:DS:AP1:AP2 out", A["pink"], 10, italic=True)
-    R(470, 512, 380, 124, 8, A["teal_s"], 1.2)
-    T(660, 533, "Low-coverage imputation", A["teal"], 13, "700")
-    T(660, 549, "0.5-4x sequencing, from likelihoods or reads", A["muted"], 10)
-    for i, s in enumerate(["PL VCF, or BAM / CRAM read natively", "Gibbs sampler: PBWT selection + weighted Li-Stephens",
-                           "Read pairs link neighbouring heterozygotes"]):
-        T(660, 569 + 18 * i, s, A["text"])
-    T(660, 627, "likelihoods in → GT:DS:GP out", A["teal_s"], 10, italic=True)
-    T(460, 660, "Genotype engine: one interpolation pass to every output format, with per-site DR2", A["text"], 11)
-    L(460, 674, 460, 688)
-
-    R(50, 690, 820, 54, 10, A["green_s"], fill="url(#sg)")
-    T(460, 710, "Genotype-engine output formats (same dosages in each)", A["green"], 13, "700")
-    for x, w, s in [(113, 120, "VCF.gz"), (248, 120, "BCF 2.2"), (383, 120, "Parquet"), (518, 155, "PGEN + dosage"), (688, 120, "SelfDecode")]:
-        o.append(f'<rect x="{x}" y="{720}" width="{w}" height="18" rx="4" fill="{A["green_s"]}" opacity="0.2"/>')
-        T(x + w / 2, 733, s, A["green"], 11, "600")
-    R(50, 756, 405, 30, 6, A["amber"], 1, dash="4,3")
-    T(252, 775, "Whole genome in one run: one multi-chromosome SRP", A["amber"], 11)
-    R(465, 756, 405, 30, 6, A["amber"], 1, dash="4,3")
-    T(667, 775, "Panels: VCF / BCF / BREF3 to SRP, and back", A["amber"], 11)
-    return "\n".join(o)
-
-
 def build(demo_dir, theme):
-    A = ARCH[theme]
     tl = Timeline()
     # first pass to measure the cycle; second pass with the real total
     for pass_ in (0, 1):
-        term, hl, dim = [], [], []
+        term = []
         t = 0.0
-        for key, label, trig, dims in SCENARIOS:
+        for key, label in SCENARIOS:
             d = os.path.join(demo_dir, key)
             if pass_ == 0:
                 tl.total = 1e9
-            t = build_scenario(d, label, trig, dims, tl, t, term, hl, dim, A)
+            t = build_scenario(d, label, tl, t, term)
         if pass_ == 0:
             tl.total = t
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" font-family="{SANS}" xml:space="preserve">',
          '<defs>',
-         f'<marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="none" stroke="{A["arrow"]}" stroke-width="1.2"/></marker>',
-         f'<linearGradient id="sg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="{A["g0"]}"/><stop offset="100%" stop-color="{A["g1"]}"/></linearGradient>',
          f'<clipPath id="vp"><rect x="{TX}" y="{Y0 + 1}" width="{TW}" height="{ROWS * LH + 2}"/></clipPath>',
          '</defs>',
-         f'<rect width="{W}" height="{H}" rx="12" fill="{A["bg"]}"/>',
+         f'<rect width="{W}" height="{H}" rx="12" fill="{PAGE_BG[theme]}"/>',
          f'<g font-family="{MONO}" font-size="{FS}">',
          f'<rect x="{TX}" y="{TY}" width="{TW}" height="{TH}" rx="9" fill="{TERM["bg"]}" stroke="{TERM["border"]}" stroke-width="1.4"/>',
          f'<circle cx="{TX + 24}" cy="{TY + 22}" r="5.5" fill="#ff5f56"/><circle cx="{TX + 44}" cy="{TY + 22}" r="5.5" fill="#ffbd2e"/><circle cx="{TX + 64}" cy="{TY + 22}" r="5.5" fill="#27c93f"/>',
          f'<text x="{TX + 86}" y="{TY + 27}" fill="{TERM["label"]}" font-family="{SANS}" font-size="12">real runs · every line as printed · time compressed</text>',
          f'<line x1="{TX}" y1="{TY + BAR}" x2="{TX + TW}" y2="{TY + BAR}" stroke="{TERM["rule"]}" stroke-width="1"/>']
     o += term
-    o.append('</g>')
-    o.append(f'<g transform="translate(0,{AY})">')
-    o.append(arch(A))
-    o.append('<g>'); o += dim; o.append('</g>')
-    o.append('<g>'); o += hl; o.append('</g>')
     o.append('</g></svg>')
     return "\n".join(o) + "\n"

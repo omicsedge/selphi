@@ -133,7 +133,7 @@ def main():
         write(f"lcwgs_{t}.svg", lcwgs_svg(t))
     import readme_demo
     for t in THEMES:
-        write(f"pipeline_{t}.svg", readme_demo.build(a.demo, t))
+        write(f"demo_{t}.svg", readme_demo.build(a.demo, t))
 
 
 if __name__ == "__main__":
