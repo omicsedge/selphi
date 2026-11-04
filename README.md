@@ -6,10 +6,17 @@
   </picture>
 </p>
 
-Selphi phases and imputes human genotypes against a haplotype reference panel. From genotyping arrays and
-sequencing calls (VCF/BCF) it writes phased genotypes with imputed dosages at every site of the panel; from
-low-coverage sequencing (aligned reads or genotype likelihoods) it writes genotypes, dosages and genotype
-probabilities. It is a single program written in Rust and needs no other tools at run time.
+Selphi phases and imputes human genotypes against a haplotype reference panel. It is a single program written in
+Rust and needs no other tools at run time. It takes three kinds of input:
+
+- **Genotyping arrays and sequencing calls** (VCF/BCF): phased genotypes with imputed dosages at every panel site.
+  A VCF with likelihoods goes to the low-coverage engine instead.
+- **Low-coverage sequencing**, 0.5-4x, straight from the aligned reads (BAM/CRAM) or from genotype likelihoods:
+  genotypes, dosages and genotype probabilities. See [below](#low-coverage-sequencing).
+- **Calls of mixed confidence**: Selphi weighs each call of a sequencing VCF by how sure it is (`PL`, `GL`, `GQ`,
+  `DP`), so sharp calls carry their site and weak or missing ones are decided by the panel; `--calls` keeps a
+  caller's variant calls and fills, from the reads, the sites it leaves out at low depth.
+  See [below](#calls-of-mixed-confidence).
 
 <p align="center">
   <picture>
@@ -23,7 +30,8 @@ probabilities. It is a single program written in Rust and needs no other tools a
 - [Quick start](#quick-start)
 - [Usage](#usage): [arrays and sequencing calls](#arrays-and-sequencing-calls) ·
   [low-coverage sequencing](#low-coverage-sequencing) · [whole genome](#whole-genome-in-one-run) ·
-  [phasing only](#phasing-only) · [phased input](#phased-input) · [caller VCF with reads](#a-callers-vcf-with-the-reads) ·
+  [phasing only](#phasing-only) · [phased input](#phased-input) · [mixed confidence](#calls-of-mixed-confidence) ·
+  [caller VCF with reads](#a-callers-vcf-with-the-reads) ·
   [exomes](#exomes-and-variant-only-vcfs) · [cohort phasing](#phasing-a-cohort-without-a-panel) ·
   [large cohorts](#large-cohorts) · [reference panels](#reference-panels) · [evaluation](#accuracy-evaluation)
 - [Output](#output) · [Main options](#main-options) · [Performance](#performance) · [Citation](#citation) · [License](#license)
@@ -96,7 +104,17 @@ selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map chr22.map --out i
 
 ### Low-coverage sequencing
 
-For genomes sequenced at about 0.5-4x. Selphi computes genotype likelihoods from the reads at the panel sites:
+For genomes sequenced at about 0.5-4x. Selphi computes genotype likelihoods from the reads at the panel sites and
+combines them with the panel: where the reads are sharp they carry the call, where they are thin or absent the panel
+does. Each output genotype is the most probable one.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/lowcov_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/lowcov_light.svg"/>
+    <img src="img/lowcov_light.svg" alt="Animation on toy data: simulated read pairs at about 1.5x, genotype likelihoods at each site, panel-copying probabilities, and 28 posterior genotype calls that all match the simulated truth" width="900"/>
+  </picture>
+</p>
 
 ```bash
 selphi --bam sample.cram --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map --out imputed --threads 16
@@ -137,6 +155,18 @@ one keeps it as one of the two phasings the imputation averages over.
 | `--keep-input-phase` | impute on the given phase, without phasing (faster) |
 | `--trust-input-phase` | always keep each sample's given phase as one of the two |
 | `--force-phasing` | phase again and ignore the given phase |
+
+### Calls of mixed confidence
+
+A sequencing VCF can say how sure each call is (`PL`, `GL`, `GQ`, `DP`). `--engine auto` picks one of three routes
+from the file and the panel, and the log says which:
+
+- **likelihoods** (most sequencing-density files with `PL`, `GL` or `GQ`): each genotype comes from the call's
+  likelihood and the panel together, so sharp calls carry their site and weak or missing ones are decided by the
+  panel. The output is that of [low-coverage data](#low-coverage-sequencing).
+- **genotype + refine** (other sequencing-density files with `GQ` or `DP`, single-chromosome panel): calls at or
+  above the confidence threshold are kept as given; the others, and missing calls, get imputed dosages.
+- **genotype** (lower density, such as arrays): calls are kept as given and missing ones are imputed.
 
 ### A caller's VCF with the reads
 
