@@ -332,7 +332,7 @@ def arch(A):
     T(460, 30, "Selphi 2 — pipeline", A["title"], 18, "600")
     for (x, w, head, body, col, dash) in [
             (30, 195, "TARGET", "VCF / BCF / BAM / CRAM", "green", None),
-            (248, 195, "REFERENCE PANEL", "SRP (single or multi-chr)", "amber", None),
+            (248, 195, "REFERENCE PANEL", "SRP (one or all chromosomes)", "amber", None),
             (466, 195, "GENETIC MAP", "PLINK format", "muted", None),
             (684, 205, "OPTIONAL", "Pedigree (PED)", "opt", "4,3")]:
         R(x, 50, w, 50, 8, A[col if col != "green" else "green_s"], 1.5 if not dash else 1, dash=dash)
@@ -340,58 +340,58 @@ def arch(A):
         T(x + w / 2, 88, body, A["text"] if not dash else A["muted"], 12.5)
     L(128, 100, 128, 130); L(346, 100, 346, 130)
     R(60, 132, 640, 38, 10, A["purple_s"], fill="url(#sg)")
-    T(380, 149, "Bitmatrix extraction", A["purple"], 12, "700")
-    T(380, 164, "1 bit per allele · shared between phasing and imputation · SIMD-accelerated", A["muted"], 11)
+    T(380, 149, "Panel held as a bit matrix", A["purple"], 12, "700")
+    T(380, 164, "1 bit per allele, shared by phasing and imputation", A["muted"], 11)
     L(380, 170, 380, 196)
 
     R(50, 198, 820, 200, 10, A["blue_s"], fill="url(#sg)")
     T(460, 220, "Phasing", A["blue"], 14, "700")
-    T(460, 237, "unphased input, and phased input by default (--keep-input-phase keeps the given phase)", A["muted"], 11)
+    T(460, 237, "genotype engine only; a phased input is re-phased and may keep its own phase as one of two (--keep-input-phase skips this)", A["muted"], 11)
     R(70, 250, 780, 136, 8, A["dblue_s"], 1.2)
     T(460, 272, "Diploid engine", A["dblue"], 13, "700")
-    for i, s in enumerate(["Genotype graph + segment HMM", "MCMC (15 iterations)", "Each sample phased as 2-3 copies (<= 1,000 samples)"]):
+    for i, s in enumerate(["Genotype graph: up to 8 configurations per segment", "Segment HMM on PBWT neighbours, sampled by MCMC", "Replicas: 2-3 copies per sample in eligible runs"]):
         T(265, 302 + 22 * i, s, A["text"])
-    for i, s in enumerate(["Common → rare two-stage (PBWT voting)", "IBD2 exclusion + match-length-weighted rare votes", "Panel-absent rare hets → rare vote (WGS)"]):
+    for i, s in enumerate(["Common sites first, rare sites on that scaffold", "Ancestry check for long-range phase errors", "Trios and duos with --ped"]):
         T(655, 302 + 22 * i, s, A["text"])
-    T(460, 377, "arrays, WGS and de-novo panels (--phase-panel)", A["muted"], 10, italic=True)
+    T(460, 377, "arrays, WGS, and cohorts phased without a panel (--phase-panel)", A["muted"], 10, italic=True)
     o.append(f'<path d="M787 100 L787 186 L895 186 L895 318 L872 318" fill="none" stroke="{A["opt"]}" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arr)"/>')
     o.append(f'<text x="905" y="252" fill="{A["opt"]}" font-size="9" transform="rotate(90,905,252)" text-anchor="middle">Mendelian scaffold</text>')
     o.append(f'<path d="M 28 100 L 12 100 L 12 548 L 48 548" fill="none" stroke="{A["blue"]}" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arr)"/>')
     o.append(f'<text x="5" y="324" fill="{A["blue"]}" font-size="10" font-weight="600" transform="rotate(-90,5,324)" text-anchor="middle">--keep-input-phase → skip</text>')
     L(460, 398, 460, 412)
     R(140, 414, 640, 28, 8, A["green_s"], 1, dash="6,3")
-    T(460, 432, "In-memory handoff: phased haplotypes + shared bitmatrix (no file I/O)", A["green"], 11)
+    T(460, 432, "Phased haplotypes passed on in memory (no intermediate files)", A["green"], 11)
     L(460, 442, 460, 458)
 
     R(50, 460, 820, 214, 10, A["pink_s"], fill="url(#sg)")
     T(460, 482, "Imputation", A["pink"], 14, "700")
-    T(460, 499, "chosen from the input: confident genotypes → genotype engine | low-coverage likelihoods or aligned reads → lcWGS engine", A["muted"], 11)
+    T(460, 499, "engine chosen from the input: genotypes → genotype engine · likelihoods or aligned reads → low-coverage engine", A["muted"], 11)
     R(70, 512, 380, 124, 8, A["pink_s"], 1.2)
     T(260, 533, "Genotype imputation", A["pink_t"], 13, "700")
-    T(260, 549, "chip / WGS confident hard calls", A["muted"], 10)
-    for i, s in enumerate(["PBWT candidate selection (whole panel up to 16,000 haps)", "Li-Stephens HMM (f32 states, f64 recombination)",
-                           "Haplotype dedup · Ne = 36.4 × n_ref, MAF-scaled"]):
+    T(260, 549, "arrays and sequencing calls", A["muted"], 10)
+    for i, s in enumerate(["PBWT selects candidate haplotypes", "Li-Stephens HMM over the typed sites",
+                           "Weights interpolated in cM to every panel site"]):
         T(260, 569 + 18 * i, s, A["text"])
-    T(260, 627, "hard calls in → dosages out", A["pink"], 10, italic=True)
+    T(260, 627, "calls in → GT:DS:AP1:AP2 out", A["pink"], 10, italic=True)
     R(470, 512, 380, 124, 8, A["teal_s"], 1.2)
-    T(660, 533, "Low-coverage WGS imputation", A["teal"], 13, "700")
-    T(660, 549, "low-coverage sequencing (genotype likelihoods)", A["muted"], 10)
-    for i, s in enumerate(["PL VCF, or BAM / CRAM with native pileup + BAQ", "Sparse PBWT ⇄ GL-weighted Li-Stephens (√n-checkpointed)",
-                           "Founder phasing HMM, re-committed every iteration"]):
+    T(660, 533, "Low-coverage imputation", A["teal"], 13, "700")
+    T(660, 549, "0.5-4x sequencing, from likelihoods or reads", A["muted"], 10)
+    for i, s in enumerate(["PL VCF, or BAM / CRAM read natively", "Gibbs sampler: PBWT selection + weighted Li-Stephens",
+                           "Read pairs link neighbouring heterozygotes"]):
         T(660, 569 + 18 * i, s, A["text"])
-    T(660, 627, "GLs in → GT:DS:GP out", A["teal_s"], 10, italic=True)
-    T(460, 660, "Tiled interpolation (1,024 × 4,096, L2-cache) · fused interpolate → encode → stream · DR2 · LD-corrected", A["text"], 11)
+    T(660, 627, "likelihoods in → GT:DS:GP out", A["teal_s"], 10, italic=True)
+    T(460, 660, "Genotype engine: one interpolation pass to every output format, with per-site DR2", A["text"], 11)
     L(460, 674, 460, 688)
 
     R(50, 690, 820, 54, 10, A["green_s"], fill="url(#sg)")
-    T(460, 710, "Multi-format output (one interpolation pass, identical dosages)", A["green"], 13, "700")
+    T(460, 710, "Genotype-engine output formats (same dosages in each)", A["green"], 13, "700")
     for x, w, s in [(113, 120, "VCF.gz"), (248, 120, "BCF 2.2"), (383, 120, "Parquet"), (518, 155, "PGEN + dosage"), (688, 120, "SelfDecode")]:
         o.append(f'<rect x="{x}" y="{720}" width="{w}" height="18" rx="4" fill="{A["green_s"]}" opacity="0.2"/>')
         T(x + w / 2, 733, s, A["green"], 11, "600")
     R(50, 756, 405, 30, 6, A["amber"], 1, dash="4,3")
-    T(252, 775, "Multi-chromosome: one SRP file, overlapped prefetch", A["amber"], 11)
+    T(252, 775, "Whole genome in one run: one multi-chromosome SRP", A["amber"], 11)
     R(465, 756, 405, 30, 6, A["amber"], 1, dash="4,3")
-    T(667, 775, "Panels: BCF / VCF / BREF3 ↔ SRP, no external converter", A["amber"], 11)
+    T(667, 775, "Panels: VCF / BCF / BREF3 to SRP, and back", A["amber"], 11)
     return "\n".join(o)
 
 

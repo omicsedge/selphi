@@ -1,25 +1,27 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 410" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
-<text x="16" y="26" fill="#1f2328" font-size="16" font-weight="700">Low-coverage imputation accuracy across depth</text>
-<text x="16" y="46" fill="#57606a" font-size="12">Per-sample R&#178; &#183; GIAB HG002-HG004, chr22:20-30 Mb &#183; 6,332-haplotype panel &#183; sites imputed by all three tools</text>
+<text x="16" y="26" fill="#1f2328" font-size="16" font-weight="700">Low-coverage sequencing: accuracy across read depth</text>
+<text x="16" y="46" fill="#57606a" font-size="12">Per-sample R&#178; &#183; GIAB HG002-HG004 from aligned reads &#183; chr22:20-30 Mb &#183; 6,332-haplotype panel</text>
 <line x1="120" y1="298.0" x2="548" y2="298.0" stroke="#d0d7de" stroke-width="1"/>
-<text x="110" y="302.0" text-anchor="end" fill="#57606a" font-size="11">0.990</text>
-<line x1="120" y1="243.0" x2="548" y2="243.0" stroke="#d0d7de" stroke-width="1"/>
-<text x="110" y="247.0" text-anchor="end" fill="#57606a" font-size="11">0.992</text>
-<line x1="120" y1="188.0" x2="548" y2="188.0" stroke="#d0d7de" stroke-width="1"/>
-<text x="110" y="192.0" text-anchor="end" fill="#57606a" font-size="11">0.994</text>
-<line x1="120" y1="133.0" x2="548" y2="133.0" stroke="#d0d7de" stroke-width="1"/>
-<text x="110" y="137.0" text-anchor="end" fill="#57606a" font-size="11">0.996</text>
+<text x="110" y="302.0" text-anchor="end" fill="#57606a" font-size="11">0.970</text>
+<line x1="120" y1="254.0" x2="548" y2="254.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="110" y="258.0" text-anchor="end" fill="#57606a" font-size="11">0.975</text>
+<line x1="120" y1="210.0" x2="548" y2="210.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="110" y="214.0" text-anchor="end" fill="#57606a" font-size="11">0.980</text>
+<line x1="120" y1="166.0" x2="548" y2="166.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="110" y="170.0" text-anchor="end" fill="#57606a" font-size="11">0.985</text>
+<line x1="120" y1="122.0" x2="548" y2="122.0" stroke="#d0d7de" stroke-width="1"/>
+<text x="110" y="126.0" text-anchor="end" fill="#57606a" font-size="11">0.990</text>
 <line x1="120" y1="78.0" x2="548" y2="78.0" stroke="#d0d7de" stroke-width="1"/>
-<text x="110" y="82.0" text-anchor="end" fill="#57606a" font-size="11">0.998</text>
+<text x="110" y="82.0" text-anchor="end" fill="#57606a" font-size="11">0.995</text>
 <text x="120.0" y="320" text-anchor="middle" fill="#57606a" font-size="12">0.5&#215;</text>
 <text x="181.1" y="320" text-anchor="middle" fill="#57606a" font-size="12">1&#215;</text>
 <text x="303.4" y="320" text-anchor="middle" fill="#57606a" font-size="12">2&#215;</text>
 <text x="548.0" y="320" text-anchor="middle" fill="#57606a" font-size="12">4&#215;</text>
 <text x="334.0" y="340" text-anchor="middle" fill="#57606a" font-size="12" font-weight="600">Sequencing coverage</text>
 <line x1="120" y1="78" x2="120" y2="298" stroke="#d0d7de" stroke-width="1"/>
-<polyline points="120.0,254.0 181.1,174.2 303.4,113.7 548.0,91.7" fill="none" stroke="#9a6700" stroke-width="2.4"/><rect x="115.8" y="249.8" width="8.4" height="8.4" rx="1" fill="#9a6700"/><rect x="176.9" y="170.0" width="8.4" height="8.4" rx="1" fill="#9a6700"/><rect x="299.2" y="109.5" width="8.4" height="8.4" rx="1" fill="#9a6700"/><rect x="543.8" y="87.5" width="8.4" height="8.4" rx="1" fill="#9a6700"/>
-<polyline points="120.0,245.7 181.1,177.0 303.4,111.0 548.0,97.3" fill="none" stroke="#1a7f37" stroke-width="2.4"/><polygon points="120.0,241.0 115.3,249.9 124.7,249.9" fill="#1a7f37"/><polygon points="181.1,172.3 176.4,181.2 185.8,181.2" fill="#1a7f37"/><polygon points="303.4,106.3 298.7,115.2 308.1,115.2" fill="#1a7f37"/><polygon points="548.0,92.6 543.3,101.5 552.7,101.5" fill="#1a7f37"/>
-<polyline points="120.0,240.3 181.1,160.5 303.4,105.5 548.0,83.5" fill="none" stroke="#0969da" stroke-width="2.4"/><circle cx="120.0" cy="240.3" r="4.2" fill="#0969da"/><circle cx="181.1" cy="160.5" r="4.2" fill="#0969da"/><circle cx="303.4" cy="105.5" r="4.2" fill="#0969da"/><circle cx="548.0" cy="83.5" r="4.2" fill="#0969da"/>
+<polyline points="120.0,291.0 181.1,186.2 303.4,132.6 548.0,93.0" fill="none" stroke="#9a6700" stroke-width="2.4"/><rect x="115.8" y="286.8" width="8.4" height="8.4" rx="1" fill="#9a6700"/><rect x="176.9" y="182.0" width="8.4" height="8.4" rx="1" fill="#9a6700"/><rect x="299.2" y="128.4" width="8.4" height="8.4" rx="1" fill="#9a6700"/><rect x="543.8" y="88.8" width="8.4" height="8.4" rx="1" fill="#9a6700"/>
+<polyline points="120.0,280.4 181.1,188.9 303.4,121.1 548.0,93.0" fill="none" stroke="#1a7f37" stroke-width="2.4"/><polygon points="120.0,275.7 115.3,284.6 124.7,284.6" fill="#1a7f37"/><polygon points="181.1,184.2 176.4,193.1 185.8,193.1" fill="#1a7f37"/><polygon points="303.4,116.4 298.7,125.3 308.1,125.3" fill="#1a7f37"/><polygon points="548.0,88.3 543.3,97.2 552.7,97.2" fill="#1a7f37"/>
+<polyline points="120.0,269.0 181.1,166.9 303.4,119.4 548.0,86.8" fill="none" stroke="#0969da" stroke-width="2.4"/><circle cx="120.0" cy="269.0" r="4.2" fill="#0969da"/><circle cx="181.1" cy="166.9" r="4.2" fill="#0969da"/><circle cx="303.4" cy="119.4" r="4.2" fill="#0969da"/><circle cx="548.0" cy="86.8" r="4.2" fill="#0969da"/>
 <line x1="413" y1="234" x2="435" y2="234" stroke="#0969da" stroke-width="2.4"/>
 <circle cx="424.0" cy="234.0" r="4.2" fill="#0969da"/>
 <text x="443" y="238" fill="#1f2328" font-size="12" font-weight="600">Selphi 2</text>
@@ -29,6 +31,6 @@
 <line x1="413" y1="274" x2="435" y2="274" stroke="#1a7f37" stroke-width="2.4"/>
 <polygon points="424.0,269.3 419.3,278.2 428.7,278.2" fill="#1a7f37"/>
 <text x="443" y="278" fill="#1f2328" font-size="12" font-weight="600">QUILT2</text>
-<text x="16" y="374" fill="#1a7f37" font-size="13" font-weight="700">Selphi 2 has the highest per-sample R&#178; at every coverage</text>
-<text x="16" y="396" fill="#57606a" font-size="12">One sample, whole chr22 at ~1.8&#215;, 16 threads: 32.5-34.6 s for Selphi 2, 31.5 s for GLIMPSE2, 128.3 s for QUILT2</text>
+<text x="16" y="372" fill="#57606a" font-size="12">Mean of three samples; sites imputed by all three tools</text>
+<text x="16" y="394" fill="#57606a" font-size="12">Whole chr22, one ~2.3&#215; sample, idle 16-core host: Selphi 2 16.6 s, GLIMPSE2 31.5 s, QUILT2 128.3 s</text>
 </svg>

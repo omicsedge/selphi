@@ -1,3 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="14 0 745 62" width="745" height="62">
-  <text x="12" y="45" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="38" font-weight="700" letter-spacing="0.3"><tspan fill="#4568f9">SEL</tspan><tspan fill="#ffffff">fDecode </tspan><tspan fill="#4568f9">PH</tspan><tspan fill="#ffffff">asing &amp; </tspan><tspan fill="#4568f9">I</tspan><tspan fill="#ffffff">mputation</tspan></text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 120" width="820" height="120" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<rect x="8.00" y="26.00" width="43.20" height="22.00" rx="11.00" fill="#4568f9"/>
+<rect x="56.00" y="26.00" width="30.40" height="22.00" rx="11.00" fill="#8aa0ff"/>
+<rect x="91.20" y="26.00" width="24.00" height="22.00" rx="11.00" fill="#f0a020"/>
+<rect x="120.00" y="26.00" width="48.00" height="22.00" rx="11.00" fill="#2b45c7"/>
+<rect x="8.00" y="72.00" width="24.00" height="22.00" rx="11.00" fill="#2b45c7"/>
+<rect x="36.80" y="72.00" width="49.60" height="22.00" rx="11.00" fill="#4568f9"/>
+<rect x="91.20" y="72.00" width="36.80" height="22.00" rx="11.00" fill="#8aa0ff"/>
+<rect x="132.80" y="72.00" width="35.20" height="22.00" rx="11.00" fill="#4568f9"/>
+<rect x="21.20" y="53.00" width="2.40" height="14.00" rx="1.20" fill="#6e7681"/>
+<rect x="50.00" y="53.00" width="2.40" height="14.00" rx="1.20" fill="#6e7681"/>
+<rect x="77.20" y="53.00" width="2.40" height="14.00" rx="1.20" fill="#6e7681"/>
+<rect x="104.40" y="53.00" width="2.40" height="14.00" rx="1.20" fill="#6e7681"/>
+<rect x="131.60" y="53.00" width="2.40" height="14.00" rx="1.20" fill="#6e7681"/>
+<rect x="154.00" y="53.00" width="2.40" height="14.00" rx="1.20" fill="#6e7681"/>
+<text x="194" y="70" fill="#e6edf3" font-size="56" font-weight="700" letter-spacing="-1">Selphi</text>
+<text x="198" y="100" fill="#8b949e" font-size="17" letter-spacing="0.2"><tspan fill="#4568f9" font-weight="700">SEL</tspan>fDecode <tspan fill="#4568f9" font-weight="700">PH</tspan>asing &amp; <tspan fill="#4568f9" font-weight="700">I</tspan>mputation</text>
 </svg>

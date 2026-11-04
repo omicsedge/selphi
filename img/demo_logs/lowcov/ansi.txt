@@ -1,6 +1,6 @@
-Script started on 2026-10-21 16:46:58+00:00 [COMMAND="selphi --refpanel chr22.srp --bam HG002.bam --reference GRCh38.fa --map chr22.map --out lowcov --threads 16 " <not executed on terminal>]
+Script started on 2026-11-04 07:59:04+00:00 [COMMAND="selphi --refpanel chr22.srp --bam HG002.bam --reference GRCh38.fa --map chr22.map --out lowcov --threads 16 " <not executed on terminal>]
 [1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
-  auto-route: aligned reads (BAM/CRAM) [32m→ lcWGS engine[0m [2m[0.0s | 42 MB][0m
+  auto-route: aligned reads (BAM/CRAM) [32m→ lcWGS engine[0m [2m[0.0s | 43 MB][0m
 [1;36m
   ___ ___ _    ___ _  _ ___
  / __| __| |  | _ \ || |_ _|
@@ -16,17 +16,21 @@ Script started on 2026-10-21 16:46:58+00:00 [COMMAND="selphi --refpanel chr22.sr
   threads:  16
   log:      lowcov.log
 
-  SRP loaded: 964078 variants, 6332 haps                       [2m[0.1s | 268 MB][0m
+  SRP loaded: 964078 variants, 6332 haps                       [2m[0.1s | 131 MB][0m
   lcWGS-BAM: 1 BAM(s), chrom chr22, 964078 panel sites (964078 SNPs, 0 indels)
+  lcWGS read-pair linkage: forward-backward and phaser at sites of panel MAF >= 0.01 (minor-allele bases below), the first 8 bases of a site of at most 3, samples of median depth <= 3 (LCWGS_LINKAGE=0: off)
   lcWGS-BAM: BAQ on (extended, partial-realignment heuristic — bcftools mpileup default); reference window 50818468 bp
-  lcWGS-BAM: HG002: 323880 reads, 9733 triggering sites, 19387 realigned (6.0%), 0 BAQ no-ops [2m[0.7s | 1316 MB][0m
-  chunked Gibbs: 82.4 cM span → 6 chunks (core 16.0 cM + 0.5 cM buffer each side) [2m[1.9s | 1326 MB][0m
-  lcWGS process memory allowance: 5.41 GB (shared/cache 1.34 GB)
-  lcwgs done: 964078 variants × 1 sample                       [2m[25.1s | 2968 MB][0m
-  Imputation quality: mean GP confidence [1;36m0.9754[0m  ·  93.7% of 964,078 calls ≥ 0.9
-  wrote imputed VCF: lowcov.vcf.gz                             [2m[25.5s | 2968 MB][0m
-  wrote dosage TSV: lowcov.dose.tsv.gz                         [2m[25.6s | 2968 MB][0m
+  lcWGS-BAM: HG002: 246215 reads, 6894 triggering sites, 7067 realigned (2.9%), 0 BAQ no-ops [2m[0.7s | 1215 MB][0m
+  lcWGS read-pair linkage: HG002: 118235 read pairs over >= 2 SNP sites, median depth 1
+  [33mlcWGS panel of 6332 haplotypes (< 30311): conditioning capped in GLIMPSE2 rank order (g2) at kpbwt 2000, no rare-carrier augmentation, 2 Gibbs chain(s) of 20 iterations (15 main) averaged; LCWGS_SMALL_PANEL=old restores the previous conditioning[0m [2m[1.3s | 1215 MB][0m
+  chunked Gibbs: 82.4 cM span → 6 chunks (core 16.0 cM + 0.5 cM buffer each side) [2m[1.3s | 1215 MB][0m
+  lcWGS process memory allowance: 5.41 GB (shared/cache 1.33 GB)
+  lcWGS read-pair linkage: 2537982 forward-backward anchor entries (2537978 drawn jointly, 4 left to per-site draws); phaser potentials on 61056 segments and 50502 boundaries, 3635 read pairs over more than two segments (Metropolis-Hastings: 221 accepted, 7 rejected)
+  lcwgs done: 964078 variants × 1 sample                       [2m[14.3s | 2472 MB][0m
+  Imputation quality: mean GP confidence [1;36m0.9985[0m  ·  99.6% of 964,078 calls ≥ 0.9
+  wrote imputed VCF: lowcov.vcf.gz                             [2m[14.6s | 2472 MB][0m
+  wrote dosage TSV: lowcov.dose.tsv.gz                         [2m[14.7s | 2472 MB][0m
 
-Total: 26s | Peak memory: 2968 MB
+Total: 15s | Peak memory: 2472 MB
 
-Script done on 2026-10-21 16:47:24+00:00 [COMMAND_EXIT_CODE="0"]
+Script done on 2026-11-04 07:59:19+00:00 [COMMAND_EXIT_CODE="0"]

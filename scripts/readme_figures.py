@@ -39,15 +39,15 @@ def esc(s):
 # --------------------------------------------------------------------------
 # Speed chart (Table 5b, warm pass; RESULT CONSUMER WHOLE-GENOME WARM)
 # --------------------------------------------------------------------------
-SPEED = [("Selphi 2", 845.2), ("Beagle 5.5", 1743.9)]
-SPEED_MEM = ("6.2 GB", "45.3 GB")
+SPEED = [("Selphi 2", 690.7), ("Beagle 5.5", 1744.0)]
+SPEED_MEM = ("5.0 GB", "45.3 GB")
 
 
 def speed_svg(t):
     c = THEMES[t]
     w_max, x0 = 470.0, 132
     vmax = max(v for _, v in SPEED)
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 248" font-family="{FONT}">',
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 232" font-family="{FONT}">',
            f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Whole-genome phasing + imputation &#183; wall time</text>',
            f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">6 samples vs the 75,552-haplotype panel &#183; 22 autosomes &#183; 16 threads &#183; idle host, panel files in page cache</text>']
     for i, ((name, sec), colour) in enumerate(zip(SPEED, (c["blue"], c["amber"]))):
@@ -58,10 +58,7 @@ def speed_svg(t):
                 f'<rect x="{x0}" y="{y}" width="{w:.1f}" height="38" rx="5" fill="{colour}"/>',
                 f'<text x="{x0 + w + 10:.1f}" y="{y + 24}" fill="{c["fg"]}" font-size="14" font-weight="700">{sec / 60:.1f} min</text>',
                 f'<text x="{x0 + w + 10:.1f}" y="{y + 10}" fill="{c["muted"]}" font-size="10">{mm}:{ss:02d} (mm:ss)</text>']
-    speedup = SPEED[1][1] / SPEED[0][1]
-    saved = (SPEED[1][1] - SPEED[0][1]) / 60
-    out += [f'<text x="16" y="210" fill="{c["green"]}" font-size="13" font-weight="700">Selphi 2 is {speedup:.1f}&#215; faster end-to-end ({saved:.1f} min saved)</text>',
-            f'<text x="16" y="232" fill="{c["muted"]}" font-size="12">Peak memory {SPEED_MEM[0]} vs {SPEED_MEM[1]} (largest chromosome)</text>',
+    out += [f'<text x="16" y="216" fill="{c["muted"]}" font-size="12">Peak memory {SPEED_MEM[0]} for Selphi 2, {SPEED_MEM[1]} for Beagle 5.5 (largest chromosome)</text>',
             '</svg>']
     return "\n".join(out) + "\n"
 
@@ -70,23 +67,23 @@ def speed_svg(t):
 # Low-coverage sweep (Table 2b, overall per-sample R2)
 # --------------------------------------------------------------------------
 COV = [0.5, 1, 2, 4]
-LC = {"Selphi 2": [0.9921, 0.9950, 0.9970, 0.9978],
-      "GLIMPSE2": [0.9916, 0.9945, 0.9967, 0.9975],
-      "QUILT2":   [0.9919, 0.9944, 0.9968, 0.9973]}
+LC = {"Selphi 2": [0.9733, 0.9849, 0.9903, 0.9940],
+      "GLIMPSE2": [0.9708, 0.9827, 0.9888, 0.9933],
+      "QUILT2":   [0.9720, 0.9824, 0.9901, 0.9933]}
 
 
 def lcwgs_svg(t):
     c = THEMES[t]
     x_l, x_r, y_t, y_b = 120, 548, 78, 298
-    lo, hi = 0.990, 0.998
+    lo, hi = 0.970, 0.995
     # Linear coverage axis: the points sit at their true distances (0.5, 1, 2, 4).
     X = lambda v: x_l + (x_r - x_l) * (v - COV[0]) / (COV[-1] - COV[0])
     Y = lambda r: y_b - (y_b - y_t) * (r - lo) / (hi - lo)
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 410" font-family="{FONT}">',
-           f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Low-coverage imputation accuracy across depth</text>',
-           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">Per-sample R&#178; &#183; GIAB HG002-HG004, chr22:20-30 Mb &#183; 6,332-haplotype panel &#183; sites imputed by all three tools</text>']
-    for k in range(5):
-        r = lo + k * (hi - lo) / 4
+           f'<text x="16" y="26" fill="{c["fg"]}" font-size="16" font-weight="700">Low-coverage sequencing: accuracy across read depth</text>',
+           f'<text x="16" y="46" fill="{c["muted"]}" font-size="12">Per-sample R&#178; &#183; GIAB HG002-HG004 from aligned reads &#183; chr22:20-30 Mb &#183; 6,332-haplotype panel</text>']
+    for k in range(6):
+        r = lo + k * (hi - lo) / 5
         y = Y(r)
         out += [f'<line x1="{x_l}" y1="{y:.1f}" x2="{x_r}" y2="{y:.1f}" stroke="{c["grid"]}" stroke-width="1"/>',
                 f'<text x="110" y="{y + 4:.1f}" text-anchor="end" fill="{c["muted"]}" font-size="11">{r:.3f}</text>']
@@ -115,8 +112,8 @@ def lcwgs_svg(t):
         out += [f'<line x1="413" y1="{y}" x2="435" y2="{y}" stroke="{col}" stroke-width="2.4"/>',
                 marker(kind, 424, y, col),
                 f'<text x="443" y="{y + 4}" fill="{c["fg"]}" font-size="12" font-weight="600">{name}</text>']
-    out += [f'<text x="16" y="374" fill="{c["green"]}" font-size="13" font-weight="700">Selphi 2 has the highest per-sample R&#178; at every coverage</text>',
-            f'<text x="16" y="396" fill="{c["muted"]}" font-size="12">One sample, whole chr22 at ~1.8&#215;, 16 threads: 32.5-34.6 s for Selphi 2, 31.5 s for GLIMPSE2, 128.3 s for QUILT2</text>',
+    out += [f'<text x="16" y="372" fill="{c["muted"]}" font-size="12">Mean of three samples; sites imputed by all three tools</text>',
+            f'<text x="16" y="394" fill="{c["muted"]}" font-size="12">Whole chr22, one ~2.3&#215; sample, idle 16-core host: Selphi 2 16.6 s, GLIMPSE2 31.5 s, QUILT2 128.3 s</text>',
             '</svg>']
     return "\n".join(out) + "\n"
 

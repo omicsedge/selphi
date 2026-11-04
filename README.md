@@ -1,611 +1,271 @@
-<p>
+<p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/title.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/title_light.svg"/>
-    <img src="img/title.svg" alt="SELfDecode PHasing & Imputation" width="900"/>
+    <img src="img/title_light.svg" alt="Selphi: SelfDecode Phasing and Imputation" width="720"/>
   </picture>
 </p>
 
-<img align="right" width="200" src="icons/selphi-logo.svg" alt="Selphi">
+Selphi phases and imputes human genotypes against a haplotype reference panel. From genotyping arrays and
+sequencing calls (VCF/BCF) it writes phased genotypes with imputed dosages at every site of the panel; from
+low-coverage sequencing (aligned reads or genotype likelihoods) it writes genotypes, dosages and genotype
+probabilities. It is a single program written in Rust and needs no other tools at run time.
 
-**Selphi** is a genotype phasing and imputation tool implemented in Rust. It provides a phasing engine (a diploid genotype graph with a segment HMM, used for every input) and two imputation engines: a Li-Stephens PBWT engine for chip/WGS hard calls, and a genotype-likelihood-aware engine for low-coverage WGS (`--lcwgs`). Everything runs in a unified, memory-efficient pipeline. All internal data structures use a bitmatrix representation (1 bit per allele), HMM kernels are SIMD-accelerated (AVX-512/AVX2 on x86, NEON on Apple Silicon), and results are fully deterministic across runs.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/how_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/how_light.svg"/>
+    <img src="img/how_light.svg" alt="Animation of Selphi's steps on a toy panel: the panel file and its one-bit-per-allele form in memory; phasing by MCMC over the genotype graph; PBWT ordering of the panel and choice of candidate haplotypes; copying weights from a Li-Stephens forward-backward pass; the weights interpolated to the untyped sites; dosages and the VCF record" width="900"/>
+  </picture>
+</p>
+
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Usage](#usage): [arrays and sequencing calls](#arrays-and-sequencing-calls) ·
+  [low-coverage sequencing](#low-coverage-sequencing) · [whole genome](#whole-genome-in-one-run) ·
+  [phasing only](#phasing-only) · [phased input](#phased-input) · [caller VCF with reads](#a-callers-vcf-with-the-reads) ·
+  [exomes](#exomes-and-variant-only-vcfs) · [cohort phasing](#phasing-a-cohort-without-a-panel) ·
+  [large cohorts](#large-cohorts) · [reference panels](#reference-panels) · [evaluation](#accuracy-evaluation)
+- [Output](#output) · [Main options](#main-options) · [Performance](#performance) · [Citation](#citation) · [License](#license)
+
+## Installation
+
+Requires Rust 1.89 or newer and a C compiler (gcc or clang).
+
+```bash
+git clone -b new_version/selphi2_cluster https://github.com/omicsedge/selphi.git   # master holds Selphi 1
+cd selphi
+cargo build --release              # binary: target/release/selphi
+cargo install --path .             # optional: put selphi on the PATH
+```
+
+Selphi builds on Linux and macOS, on x86_64 and aarch64 (Apple Silicon, AWS Graviton). x86_64 builds need a CPU
+with AVX2 and FMA (Intel Haswell, AMD Zen or newer).
+`scripts/build-release.sh` writes a Linux binary to `dist/` (`--musl` adds a static build for Alpine or scratch
+containers, about 60% slower).
+
+**Inputs you need.** A phased reference panel, a genetic map in PLINK format (one file per chromosome or one for
+the whole genome; the [Beagle GRCh38 maps](https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/) work as
+they are) and, for reads, the reference FASTA with its `.fai` index. All of them on the same genome build as the
+target.
+
+## Quick start
+
+```bash
+# 1. Convert the reference panel once (VCF.gz, BCF or BREF3): writes panel.chr22.srp next to it
+selphi --prepare-reference-from panel.chr22.bcf --threads 16
+
+# 2a. Array or sequencing genotypes (VCF/BCF, phased or not, one or many samples)
+selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map plink.chr22.GRCh38.map \
+  --out imputed --threads 16
+
+# 2b. Low-coverage sequencing, straight from the aligned reads
+selphi --bam sample.bam --reference GRCh38.fa --refpanel panel.chr22.srp \
+  --map plink.chr22.GRCh38.map --out imputed --threads 16
+```
+
+No other option is needed: Selphi reads the input, chooses the engine and the phasing settings, and says in the log
+what it chose. The result is `imputed.vcf.gz` with its index. Three real runs, replayed from their logs:
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="img/pipeline_dark.svg"/>
     <source media="(prefers-color-scheme: light)" srcset="img/pipeline_light.svg"/>
-    <img src="img/pipeline_dark.svg" alt="Three real runs replayed line by line with the colours Selphi prints (chip array phase + impute, WGS phase-only, low-coverage BAM); the pipeline diagram below lights up each stage as its log line appears" width="900"/>
+    <img src="img/pipeline_light.svg" alt="Three real runs replayed line by line (an array cohort phased and imputed, WGS samples phased only, a low-coverage BAM imputed), with the pipeline diagram lighting up each stage as its log line appears" width="900"/>
   </picture>
 </p>
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="img/speed_dark.svg"/>
-    <source media="(prefers-color-scheme: light)" srcset="img/speed_light.svg"/>
-    <img src="img/speed_dark.svg" alt="Whole-genome phasing + imputation wall time with the panel files in the page cache: Selphi 2 11.5 min vs Beagle 5.5 29.1 min, peak memory 5.0 GB vs 45.3 GB (6 samples vs the 75,552-haplotype panel, 22 autosomes, 16 threads)" width="720"/>
-  </picture>
-</p>
-
-> Methodology, parameters, and full benchmark tables (accuracy, phasing switch-error, speed/memory, and comparisons to Beagle, IMPUTE5, Minimac4, SHAPEIT5, GLIMPSE2 and QUILT2) are in the Selphi 2 manuscript (in preparation). This README is a usage reference.
-
-## Quick start
-
-```bash
-# 1. Build (Rust 1.89+)
-git clone -b new_version/selphi2_cluster https://github.com/omicsedge/selphi.git && cd selphi
-cargo build --release                       # binary: target/release/selphi
-
-# 2. Convert the reference panel once: VCF.gz, BCF or BREF3 -> panel.chr22.srp next to the source
-selphi --prepare-reference-from panel.chr22.bcf --threads 16
-
-# 3a. Array or WGS genotypes (VCF/BCF, phased or unphased)
-selphi --refpanel panel.chr22.srp --input sample.vcf.gz --map plink.chr22.GRCh38.map \
-  --out imputed --threads 16
-
-# 3b. Low-coverage sequencing, straight from aligned reads (a PL VCF works too, via --input)
-selphi --bam sample.bam --reference GRCh38.fa --refpanel panel.chr22.srp \
-  --map plink.chr22.GRCh38.map --out imputed --threads 16
-```
-
-No other flag is needed. Selphi reads the input and picks the engine (array, WGS or low-coverage reads), phases the samples and sets the phasing from the size of the run, and the log says what it chose. The result is `imputed.vcf.gz` with its `.tbi`. Add `--bcf`, `--parquet`, `--pgen` or `--selfdecode` for other formats, `--phase-only` to phase without imputing, and see [Whole-genome imputation](#whole-genome-imputation) to run every chromosome in one command. A genetic map in PLINK format is required ([Genetic maps](#genetic-maps)).
-
-## Contents
-
-- [Quick start](#quick-start)
-- [Installation](#installation)
-  - [Distribution binaries](#distribution-binaries)
-  - [Genetic maps](#genetic-maps)
-- [Usage](#usage)
-  - [Engine selection (--engine)](#engine-selection---engine)
-  - [Full pipeline (phase + impute)](#full-pipeline-phase--impute)
-  - [Phased input](#phased-input)
-  - [Phase-only](#phase-only)
-  - [Allele reconciliation (--allele-match)](#allele-reconciliation---allele-match)
-  - [Missing genotypes](#missing-genotypes)
-  - [Variant-only and exome VCFs](#variant-only-and-exome-vcfs)
-  - [gVCF and all-sites VCFs](#gvcf-and-all-sites-vcfs)
-  - [Filtered records](#filtered-records)
-  - [Sex chromosomes](#sex-chromosomes)
-  - [Panel phasing (de-novo, no reference)](#panel-phasing-de-novo-no-reference)
-  - [Whole-genome imputation](#whole-genome-imputation)
-  - [Low-coverage WGS (--lcwgs)](#low-coverage-wgs---lcwgs)
-  - [Memory-bounded mode (biobank-scale)](#memory-bounded-mode-biobank-scale)
-  - [Reference panel preparation](#reference-panel-preparation)
-- [Output formats](#output-formats)
-  - [Target sites absent from the panel](#target-sites-absent-from-the-panel)
-  - [Output fields](#output-fields)
-- [Accuracy evaluation](#accuracy-evaluation)
-- [Indexing](#indexing)
-- [Self-test](#self-test)
-- [CLI reference](#cli-reference)
-- [How it works](#how-it-works)
-- [Citation](#citation)
-- [Non-Commercial Use License](#non-commercial-use-license)
-
-## Installation
-
-Requires Rust 1.89+ (edition 2024) and a C compiler (gcc or clang): cargo builds the bundled zstd, bzip2, xz/lzma and mimalloc C sources, so no other development packages are needed. If the system liblzma development files are present, cargo links liblzma dynamically instead, and the binary then needs `liblzma.so.5` at run time.
-
-```bash
-git clone -b new_version/selphi2_cluster https://github.com/omicsedge/selphi.git   # the default branch (master) is Selphi 1
-cd selphi
-cargo build --release
-# Binary: target/release/selphi
-```
-
-Optionally install to PATH:
-
-```bash
-cargo install --path .
-```
-
-Selphi builds for Linux x86_64, macOS x86_64, and aarch64 (Apple Silicon / AWS Graviton), one build per platform. x86_64 builds target `x86-64-v3` (AVX2/FMA: Intel Haswell, AMD Zen or newer) and do not start on older CPUs; build with `RUSTFLAGS="-C target-cpu=native"` for another CPU. Within a build, AVX-512 is picked at startup with one cached check, and NEON is used on aarch64; no recompilation. `SELPHI_FORCE_SCALAR=1` forces the scalar path for parity testing, `SELPHI_QUIET_SIMD=1` suppresses the startup line.
-
-### Distribution binaries
-
-`scripts/build-release.sh` produces named binaries in `dist/`:
-
-```bash
-./scripts/build-release.sh            # selphi-linux-x86_64           (glibc dynamic)
-./scripts/build-release.sh --musl     # also: selphi-linux-x86_64-musl (static)
-```
-
-| Binary | When to use | Trade-off |
-|---|---|---|
-| `selphi-linux-x86_64` | Default. Server / cluster / cloud. | Fast. Needs glibc ≥ 2.39 as built here; rebuild in an older-glibc container (Ubuntu 18.04/20.04, `manylinux2014`) to lower the floor. |
-| `selphi-linux-x86_64-musl` | Alpine, Docker `scratch`, very old distros. | Self-contained, no libc dependency; ~60% slower in the HMM hot path. |
-
-The musl build needs `apt install musl-tools` and `rustup target add x86_64-unknown-linux-musl`.
-
-### Genetic maps
-
-Selphi needs a genetic map in PLINK format (cM positions); Beagle maps work directly. One file per chromosome (e.g. `plink.chr22.GRCh38.map`); a genome-wide file also works, as only the run's chromosome is read from it. Positions outside the map are extrapolated at the chromosome's mean rate, in phasing, imputation and the low-coverage engine alike. Recommended: [GRCh38 genetic maps](https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/).
 
 ## Usage
 
-Input is a standard VCF or BCF, phased (`0|1`) or unphased (`0/1`). Selphi phases the input when any sample has a heterozygous call written with `/` (homozygous and haploid calls carry no phase and do not count). An already phased input is phased again too, and its own phase is kept where it agrees with the new one (see [Phased input](#phased-input)). A haploid call (a male's chrX `1`, chrY, MT) is read as the homozygote, as Beagle and `bcftools +fixploidy` do. Windows line endings are accepted. A multi-allelic record is split into one biallelic marker per ALT (the `bcftools norm -m-` convention: each counts its own ALT allele); ALTs the panel lacks are written to the output as split records. When two records match the same panel variant (duplicated probes), the first is kept and the count is logged. A REF/ALT-swapped record is matched to the panel only for substitutions: an insertion and the opposite deletion at one position are different variants. Only target sites that match a panel site are used for phasing and imputation (the log reports `Shared markers: N (x% of target)`); the others are still written to the output, as given (see [Target sites absent from the panel](#target-sites-absent-from-the-panel)).
-
-### Engine selection (`--engine`)
-
-`--engine auto` (the default) sniffs the target and picks the imputation engine: aligned reads or a `PL` VCF route to the low-coverage engine; confident WGS-density calls with a GQ/DP field route to the genotype engine with GL-aware refinement, except a VCF whose header declares GT and GQ but neither `PL` nor `GL` (a callset written without its likelihoods): it goes to the low-coverage engine on the likelihoods each call stands for (the called genotype 0, a genotype one allele away GQ, the other homozygote 6.73 GQ). On GIAB HG003-HG007 chromosome 20 at about 4.8x / 12x / 36x that is +0.021 / +0.012 / +0.001 per-sample R² over genotype + refinement, every MAF bin above it on average; such a file with reference blocks, or listing under half the panel's sites in its span, keeps the genotype engine, and `SELPHI_AUTOROUTE_GQ=0` restores that route for every file; a chip array or any other GT input, whatever its call rate, routes to the plain genotype engine (the low-coverage engine reads `PL`, not GT). A `PL` file whose calls the reads settle (80% or more with the second-best genotype 20 Phred below the best) goes to the genotype engine instead, reading the call confidence from `PL`, when it lists under half the panel's sites in its span and either carries reference calls or will have its omissions read as reference (an exome, a targeted panel, a variant-only genome; see [Variant-only and exome VCFs](#variant-only-and-exome-vcfs)); on a multi-chromosome panel that rule needs 95% of the calls settled, since the multi-chromosome genotype path writes calls as given. A `GL` field is read as `PL` (`round(-10·GL)`), here and in both engines. A gVCF stays on the low-coverage engine, which reads its reference blocks (see [gVCF and all-sites VCFs](#gvcf-and-all-sites-vcfs)); its settled share is counted on its variant records, not its blocks. `--phase-only` never routes to the low-coverage engine; with aligned reads it is refused. A VCF without GT goes to the low-coverage engine, as does any run given `--reference`. Force a specific engine with `--engine lcwgs | genotype | refine` (the legacy `--lcwgs` and `--refine` flags still work and map onto these; `--engine genotype` is the explicit force-off). Genotype input, chip or WGS, is phased by the diploid genotype-graph engine.
-
-### Full pipeline (phase + impute)
+### Arrays and sequencing calls
 
 ```bash
-selphi \
-  --refpanel reference.srp \
-  --input chip_genotypes.vcf.gz \
-  --map genetic_map.map \
-  --out imputed \
-  --threads 16
+selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map chr22.map --out imputed --threads 16
 ```
+
+- Input is VCF or BCF, phased or unphased. Selphi phases the samples, then imputes every panel site.
+- Multi-allelic records are split. A substitution with REF and ALT swapped against the panel is matched (not a
+  palindromic A/T or C/G SNP); `--allele-match full` also matches strand flips.
+- Records the panel does not have are written back with their genotype calls (`--drop-unmatched` leaves them out).
+- Missing genotypes (`./.`) are imputed. A call whose FILTER is not `PASS` is read as missing
+  (`--input-filter keep` reads it as given).
+- A sequencing VCF with likelihoods (`PL`) may be routed to the low-coverage engine, as the log says;
+  `--engine genotype` keeps it on this one.
+- chrX: men are recognised from their genotypes. Give the whole chrX map: `plink.chrX_par1` and `_par2` files next
+  to the chrX map are joined automatically. chrY and MT are not imputed.
+
+### Low-coverage sequencing
+
+For genomes sequenced at about 0.5-4x. Selphi computes genotype likelihoods from the reads at the panel sites:
+
+```bash
+selphi --bam sample.cram --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map --out imputed --threads 16
+selphi --bam-list bams.txt --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map --out imputed   # one path per line
+selphi --input sample.pl.vcf.gz --refpanel panel.chr22.srp --map chr22.map --out imputed                   # a VCF/BCF with PL
+```
+
+Pass `--reference` for BAM files too: CRAM needs it, and for BAM it enables base alignment quality as in
+`bcftools mpileup`. With reads, `--region chr22:20000000-30000000` limits the run to a region. The output is
+`imputed.vcf.gz` (unphased `GT`, `DS`, `GP`) and `imputed.dose.tsv.gz`.
+
+### Whole genome in one run
+
+```bash
+selphi --prepare-reference-from panels/ --out all_chromosomes --threads 16     # a folder of per-chromosome BCFs
+selphi --refpanel all_chromosomes.srp --input genome.vcf.gz --map-dir maps/ --out imputed --threads 16
+```
+
+The chromosomes run one after the other into one VCF.gz (or BCF with `--bcf`). The same works with `--bam`, which
+writes a VCF.gz and a dosage table. `--map` also accepts one genome-wide map.
+
+### Phasing only
+
+```bash
+selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map chr22.map --out phased --phase-only
+```
+
+Writes `phased.vcf.gz`. Needs genotype calls and a single-chromosome panel. An input that is already phased gives
+no output unless `--force-phasing` is added.
 
 ### Phased input
 
-Imputing on the phase an input arrives with scores below re-phasing it: on 801 1000 Genomes array samples (chromosome 22, 1000 Genomes panel) a Beagle-phased input gives OVERALL R² 0.4796 imputed on its phase (`--keep-input-phase`) and 0.4895 re-phased with `--force-phasing` (0.4899 from a SHAPEIT5-phased input), which phases such a cohort as two copies per sample like an unphased input. Keeping a good given phase as one phase-ensemble member, with the re-phased chain's solution as the other, scores about the same on this cohort (0.4896 Beagle-phased, 0.4898 SHAPEIT5-phased with `--trust-input-phase`; chromosome 1 +0.0089 over the given phase, 801 of 801 samples up), whereas a poor one lowers the result (Beagle's phase with 10% extra switches: 0.4655; a random phase: 0.4051). The default below, which keeps the given phase per sample, scores 0.4889 on the Beagle-phased input: above imputing on the given phase, 0.0006 below `--force-phasing` on this 801-sample cohort. So, by default, a phased input is re-phased and each sample is judged on its own: its given phase stays as ensemble member 0 when at most 5% of its consecutive heterozygous pairs at the panel sites have a different relative phase in the new solution (`SELPHI_INPUT_PHASE_GATE`, default 0.05; Beagle or SHAPEIT5 phase against Selphi's: 4.0%, 95th percentile 6.3%; another Selphi seed: 3.0%); otherwise the sample gets the re-phased chain's two members (its Viterbi solution and an MCMC sample). A sample with fewer than 50 such pairs keeps its phase. The log reports how many samples kept their phase and the median disagreement. A kept sample's output genotypes keep the orientation of its input heterozygotes, and its no-calls are filled as an unphased input's are.
+By default a phased input is phased again, and each sample whose given phase agrees well overall with the new
+one keeps it as one of the two phasings the imputation averages over.
 
-- `--keep-input-phase`: impute on the given phase, without phasing (faster; for comparisons that must share one phase).
-- `--trust-input-phase`: keep the given phase for every sample, whatever its disagreement.
-- `--force-phasing`: re-phase and do not use the given phase.
+| Option | Effect |
+|---|---|
+| `--keep-input-phase` | impute on the given phase, without phasing (faster) |
+| `--trust-input-phase` | always keep each sample's given phase as one of the two |
+| `--force-phasing` | phase again and ignore the given phase |
 
-A phased input under the default or `--trust-input-phase` is not given the phasing replicas an unphased run of up to 1,000 samples gets (see [How it works](#how-it-works)): its members stay its given phase and the re-phased solution, or the re-phased solution's two. Under `--force-phasing` it is phased like an unphased input, replicas included. An input with no heterozygous call at the panel sites (a man's chromosome X imputed on its own) has no phase to keep or re-estimate and is not phased, unless `--force-phasing`. With `--sample-batch-size` there is one member: a sample that keeps its phase is imputed on it (as with `--keep-input-phase`), one that does not on the re-phased solution.
+### A caller's VCF with the reads
 
-### Phase-only
-
-```bash
-selphi \
-  --refpanel reference.srp \
-  --input wgs_genotypes.vcf.gz \
-  --map genetic_map.map \
-  --out phased \
-  --phase-only
-```
-
-Phase-only needs a single-chromosome `.srp` (a multi-chromosome SRP or `--refpanel-dir` is refused). With `--phase-only` an already phased input is left as it is (nothing is written) unless you add `--force-phasing`. Whether the input is phased is decided on the records that match the panel: records absent from the panel are written back as given and never phased, so an unphased heterozygote there (as a phase-only output carries) does not trigger re-phasing. The order in which an unphased call lists its alleles (`1/0` or `0/1`) carries no information and does not affect the result.
-
-With `SELPHI_DIPLOID_PQ=1` (experimental) the phase-only VCF also carries `FORMAT/PQ` at each heterozygote the segment HMM phased: the phred-scaled posterior probability (an integer, capped at 60) that its phase relative to the previous heterozygote of the sample is wrong, read from the posteriors the MCMC already stores. It ranks pairs well (54 trio children: AUC 0.96 on array sites, 0.95 at WGS density; the lowest tenth of PQ values holds 88% of array switch errors) and is calibrated below PQ 7, but overstates confidence above it (PQ 13-19 means about 8% errors, not 3%), so read it as a ranking more than as an exact probability.
-
-### Long-range phase check for two-continent ancestry
-
-One person phased alone against a large panel carries long-range orientation errors: stretches of megabases where the two haplotypes are swapped against the rest of the chromosome. For someone whose parents come from two continents the panel shows them: window by window each haplotype is closest to one continental group of the panel's 1000 Genomes samples, and an inversion makes the two haplotypes trade groups. By default (`SELPHI_ANC_POST=apply`) Selphi reads that signal after phasing and undoes the inversions in the phased solution before imputation (`report` only logs what it would do; `off` restores the previous output exactly). Per sample and chromosome it scores 60-site windows against an equal number of AFR, EAS, EUR and SAS panel haplotypes (1000 Genomes superpopulations from an embedded table; the admixed AMR, ASW and ACB samples are never labels), runs a Viterbi over the group of each haplotype and the orientation with a flip prior from the solution's phase quality, and applies the path only to a two-continent reading: one pair of different groups over at least 70% of the windows (`SELPHI_ANC_PAIR_FRAC`), a likelihood at least 0.4 per window above the best one-group reading (`SELPHI_ANC_LR_MIN`), and at most 0.04 group changes per window (`SELPHI_ANC_CHANGE_RATE_MAX`; a child of two continents keeps its two groups, an old admixture trades them). Each change is placed at the heterozygote that best splits the two groups' allele frequencies and has the lowest phase quality. At sequencing density the windows use one common panel SNP per 5 kb and the change is placed among all heterozygotes.
-
-Measured on chromosome 22 against the 75,552-haplotype production panel with the targets' families and relatives removed, one sample at a time: synthetic children of two continents (one haplotype from each of two 1000 Genomes samples, exact truth) keep 1.1 orientation changes of 1 Mb or longer per chromosome instead of 5.7-6.3 and 0.15-0.17 of 5 Mb or longer instead of 1.3, with switch error 0.15-0.17 percentage points lower; 54 real trio children (alone and jointly), 60 synthetic same-population and 66 within-continent children are left exactly as phased, and so are 920 of 925 HGDP people on chromosome 22 (against the 1000 Genomes panel); across the 22 autosomes 41 of them change on at least one chromosome (64 of 20,350), all from populations whose old admixture between continents reads as two groups (Central or South Asian, Middle Eastern or North African, Yakut, Xibo and Maya). At sequencing density (1.07 million sites, 1000 Genomes panel) the same synthetic children keep 2.8 long changes instead of 8.5 and the 54 real children are unchanged. Imputed against the full production panel with exact truth, 120 held-out children of two continents gain 0.0008 per-sample R² (75 of 120 up; African-mixed pairs +0.001 to +0.002) and 66 children of two populations of one continent are unchanged, as are six consumer-array genomes and the 801-sample 1000 Genomes cohort. Mixes within a continent are not detected. The check needs the panel at the array sites, so `--phase-only` runs it only within `SELPHI_PHASE_ONLY_RARE_REF_GB`.
-
-### Allele reconciliation (`--allele-match`)
-
-Target sites are matched to the panel, and by default REF/ALT-swapped sites are reconciled (a chip that labels REF/ALT opposite the panel would otherwise silently lose those markers). Choose the level:
-
-```bash
-selphi ... --allele-match full        # none | swap (default) | strand | full
-```
-
-- `none`: exact REF/ALT only (no reconciliation)
-- `swap` (default): also accept REF/ALT-swapped sites (recodes the genotype to panel orientation) — unambiguous
-- `strand`: also accept opposite-strand SNPs (reverse-complement, with or without a REF/ALT swap), but not plain same-strand swaps, so it loses the sites `swap` reconciles
-- `full`: swap + strand
-
-`strand`/`full` carry a small false-match risk on non-palindromic SNPs (a target variant absent from the panel can reverse-complement onto a different one), so they stay opt-in. Palindromic SNPs (A/T, C/G) are matched by exact equality only. Sites that already match exactly are never touched, so conforming input is bit-identical regardless of mode. The number of reconciled sites is reported in the log.
-
-### Missing genotypes
-
-No-call genotypes in the target (`./.`, common on genotyping arrays at ~1–2% of sites per sample, and at every site of a batch that another sample's array typed) carry no information, and Selphi treats them as absent. A site that no sample called is imputed as an untyped panel site, so a single user's no-call gives exactly the result of leaving the record out. Where only some samples are missing, the diploid phasing keeps the no-call missing and imputes it with the segment HMM at every MCMC iteration, as SHAPEIT5 does (the phased output carries that imputed allele at common sites and the nearest PBWT neighbours' majority at rare ones; `SELPHI_DIPLOID_NOCALL_OBSERVED=1` restores entering the neighbours' majority as an observed genotype, which cost 0.004 imputation R² on an 801-sample array cohort with 2% no-calls), while the imputation of each sample that misses the site runs its candidate selection, PBWT and Li-Stephens HMM over the sites that sample called and places its copying weights at the no-call by cM-linear interpolation between its called sites on either side — the dosages it would get if the record were left out for it, so imputing users together gives each of them what imputing them one at a time gives. The output at such a typed site is the imputed dosage for the samples that are missing it, and their exact call for the others.
-
-### Variant-only and exome VCFs
-
-A VCF that lists only the sites where the sample carries an ALT allele, the usual WGS or exome deliverable, leaves out its reference homozygotes. Imputing those sites as if they were missing costs accuracy and calls ALT alleles the sample does not carry: on HG002 at 30× (chromosome 22, 4,478-haplotype panel) a variant-only file scores per-sample R² 0.9806 with 1,526 false ALT calls, against 0.9970 and 133 for the same calls with the reference homozygotes written out. Selphi therefore reads the panel sites such a file leaves out as reference homozygotes:
-
-- **automatically**, for one sample with at least 1,000 ALT calls, reference calls (0/0 records, or ALT `.` records below all-sites density) up to 0.5% of them, 300 or more records per Mb and a median FORMAT/DP of 8 or more (without DP, a median GQ of 20 or more; a GT-only file is taken as the standard-depth genome such a deliverable is), along the span of its records (a stretch of more than 100 kb without a record is left to imputation). The HG002 file then scores 0.9969 with 132 false ALT calls; at 10× (median DP 10) filling still raises R² from 0.9737 to 0.9764 (false ALT calls 1,852 to 116).
-- **with `--callable regions.bed`**, inside the given regions for every sample: an exome's capture targets, or the callable regions of a genome. An HG003 exome (IDT capture) scores 0.973 inside its targets against 0.917 without.
-
-It does not at positions the file lists with any allele or covers with a deletion, at no-call records, inside a structural variant's END/SVLEN span, at panel positions holding two records, for indels when the file has none, below the depth gate (at 4× a caller leaves out 25% of the true ALT sites), when a quarter or less of the file's records match the panel (a file on another genome build), or when the added sites would make the chromosome's panel matrix exceed 4 GB (`SELPHI_VARIANT_ONLY_REF_GB`; a 75,552-haplotype panel needs 9.4 KB per site). Each case is logged. The sites read as reference are written as 0/0 calls flagged `IMP`, so they can be told apart from the input's own calls. `SELPHI_VARIANT_ONLY_FILL=0` turns the automatic reading off. On chrX the sex test leaves the sites read as reference out, so a woman's heterozygosity is measured on her own calls, and a man, whose variant-only calls are a few percent heterozygous (HG002 30×: DeepVariant 4.0%, bcftools 9.4%, against 57-59% for HG001), is one X below 25% of them. On a 1000 Genomes chrX panel without HG001 and her parents, per-sample R² went from 0.9515 to 0.9694 (HG002, DeepVariant), 0.7956 to 0.8110 (HG002, bcftools diploid calls), 0.9781 to 0.9836 (HG001, DeepVariant) and 0.9763 to 0.9818 (HG001, DRAGEN), with fewer false ALT calls in each; HG002 held diploid scores 0.9689. `SELPHI_VARIANT_ONLY_CHRX=0` keeps chrX imputed. The sites read as reference are homozygous, so they carry no phase: when the file's own calls are a genome's (300 or more per Mb), they are left out of the phasing scaffold (HG002 chrX: phasing 200 → 23 s, the run 7:55 → 4:51; per-sample R² unchanged within seed-to-seed variation on chromosomes 22 and X); an exome keeps them, its few heterozygotes being phased better with them (HG003 chromosome 22 with `--callable`: 0.8134 against 0.8077). `SELPHI_FILL_HMM_MAF=0.05` also leaves those below that panel frequency out of the imputation model (still written as 0/0): five times faster again (chromosome 22: 71-74 → 15 s, 6.8-8.3 → 1.6-1.8 GB) at a per-sample R² cost of 0.00004-0.00009 for HG001 over three seeds (HG002 unchanged), so it is not the default. For an exome the BAM is better still when it exists: its off-target reads give the low-coverage engine the rest of the genome (HG003 chromosome 22 outside the targets: R² 0.902 from the BAM against 0.808 from the VCF with `--callable`).
-
-### gVCF and all-sites VCFs
-
-A gVCF or an all-sites VCF writes its reference calls itself: reference blocks (`<NON_REF>`, `<*>` or `<X>` ALTs, or ALT `.` with an END, as `bcftools call --gvcf` writes them) and ALT `.` records, one per site. Selphi reads them as the sample's calls, not as missing data:
-
-- **likelihood files** (`PL`) stay on the low-coverage engine, which gives each panel SNP inside a block the block's likelihoods (its `PL` for the placeholder allele; for a GT:DP block, the depth of its reference reads at a 1% base error), splits multi-allelic and `X,<NON_REF>` records into one site per ALT with that ALT's `PL` subset, and reads a VCF and its BCF copy identically. HG002 chromosome 22 from `bcftools mpileup | bcftools call -m --gvcf 20`, scored at the panel's sites: per-sample R² 0.9975 at 30× and 0.9959 at 10×, against 0.9794 and 0.9772 with the blocks read as missing and 0.9972 and 0.9910 for the genotype engine reading them as reference calls.
-- **on the genotype engine** (a file without `PL`, `--engine genotype`/`refine`, `--phase-only`), the panel sites inside the file's good-quality reference calls are read as 0/0 calls flagged `IMP`: GQ, else RGQ, else the gap between the two best `PL`, of 20 or more; FORMAT/DP of 10 or more when that is the only field. No-call and low-quality blocks, structural variants over their END/SVLEN span and spanning deletions keep their positions from being read as reference, and a check of the calls' REF bases against the panel's catches a file on another build. An all-sites HG002 30× file at the panel's sites scores 0.997030, as the same calls written as 0/0 records do (0.997049; 0.981 before, when its ALT `.` records were dropped and written back).
-- ALT `.` records count as calls only on a chromosome with 5,000 or more records per Mb, so an array exported with ALT `.` at its monomorphic sites is read as before; on such a chromosome they are not written back to the output (they were 869,567 of 1.8 million output records on chromosome 22), nor are reference blocks, ever.
-
-### Filtered records
-
-A record whose FILTER is set and is not `PASS` is one its caller rejected. By default (`--input-filter auto`) Selphi keeps the record's position but reads its calls as no-calls: the site is imputed for that sample, the variant-only reading above never takes the position as reference, and a record the panel lacks is written back with no-calls. The low-coverage engine reads a filtered record's likelihoods as given, since it weighs each by its own values. DeepVariant writes the candidates it rejects as `RefCall` records with 0/0 and `./.` calls; read as calls, those 0/0 records also keep a variant-only file from being recognised as one. On its raw 30× output for chromosome 22 (73,778 and 75,985 `RefCall` records), HG001 scores per-sample R² 0.98983 when they are read as calls and 0.99637 when they are not (false ALT calls 1,075 → 484); HG002 scores 0.98290 → 0.99636 (1,914 → 487). A DRAGEN HG001 file with 689 filtered records goes from 0.99811 to 0.99871 (346 → 297). `--input-filter keep` reads every record as given, as Beagle, SHAPEIT5 and GLIMPSE2 do; `--input-filter missing` also gives the low-coverage engine flat likelihoods at filtered records (the DRAGEN file on that engine: 0.98995 → 0.98980, within noise).
-
-### Sex chromosomes
-
-- **chrX**: when Selphi phases the target (unless `--keep-input-phase` on a phased input), males are auto-detected (low heterozygosity outside the pseudo-autosomal regions) and treated as diploid inside PAR1/PAR2 and haploid elsewhere: their PAR heterozygous calls are kept, their non-PAR het calls (genotyping errors) are reset before phasing. PAR coordinates follow `--build` (`grch38`, `grch37`, or `auto`, the default, inferred from the panel). `--chrx-no-par` treats males as haploid over the whole chromosome. Male chrX genotypes and dosages are written diploid; a phased input imputed with `--keep-input-phase` is used as is. Give chrX its whole genetic map: the PLINK GRCh38/37 maps put PAR1 and PAR2 in their own files. With `--map plink.chrX.GRCh38.map` the `plink.chrX_par1`/`_par2` files beside it are joined automatically (the log says so), as they are under `--map-dir`; `--map a,b,c` joins any list of files in position order, each continuing the previous one's cM. Without the PAR files, PAR1's ~21 cM would be extrapolated from the end of the non-PAR map and imputation there suffers. Some arrays report a man's whole chrX, PARs included, as single letters, which normalisation turns into homozygous calls although about half of them are heterozygous: a male with no heterozygous call among at least 50 called PAR sites has those calls entered with low confidence (`SELPHI_PAR_COLLAPSED_CONF`, default 0.1), so the copying model leans on the panel there while the calls themselves are written as given (PAR1 imputed SNP R² 0.60-0.65 → 0.68-0.72 on three such men; a man with real PAR heterozygotes is never selected). A male imputed on his own has no heterozygous non-PAR call; his calls at sites common in the panel still form the phasing scaffold (every called site when none is).
-- **chrY / chrMT**: refused, because the Li-Stephens recombination model does not apply to a non-recombining / haploid contig and standard panels omit them. In whole-genome runs they are skipped with a warning. `SELPHI_ALLOW_NONRECOMB=1` forces a run.
-
-### Panel phasing (de-novo, no reference)
-
-Phase an unphased cohort using the cohort itself as the conditioning set (SHAPEIT5/Beagle-style reference-panel construction), in one command:
-
-```bash
-# --input: VCF.gz, .srp, or .bref3 (re-phase an existing panel)
-# --srp / --bref3: also emit native .srp / .bref3 reference panels
-selphi --phase-panel \
-  --input cohort.vcf.gz \
-  --map genetic_map.map \
-  --out panel \
-  --srp --bref3 \
-  --threads 16
-
-# Phase one region only (the whole input is still read first)
-selphi --phase-panel --input cohort.vcf.gz --map map.map --out panel --region 22:16000000-20000000
-```
-
-Output is always `panel.vcf.gz`; `--srp`/`--bref3` additionally emit native reference panels (the `.srp` is directly usable as `--refpanel`). Cohorts too large for the memory budget are split into overlapping chunks of a fixed number of variants, sized from available RAM, and ligated; `--chunk-vars N` sets the variants per chunk. For biobank scale pass an indexed BCF (`.bcf` + `.csi`): at 16,000 samples or more it is streamed chunk by chunk with bounded memory (`--region` turns streaming off). Missing genotypes are imputed during phasing (see Missing genotypes). On chromosome X the diploid engine treats men as haploid outside PAR1/PAR2, as the imputation path does: men are read from `--haploids` or recognised by fewer than 1% heterozygous calls outside the PARs (over the whole cohort; a streamed cohort takes them from `--haploids` only), their heterozygous calls there are reset as genotyping errors, and their missing genotypes there are imputed as one allele on both haplotypes (`--chrx-no-par` makes them haploid over the whole chromosome).
-
-### Whole-genome imputation
-
-A single multi-chromosome SRP file imputes the entire genome in one command (no per-chromosome splitting or shell loops):
-
-```bash
-selphi \
-  --refpanel all_chromosomes.srp \
-  --input whole_genome.vcf.gz \
-  --map all_chromosomes.map \
-  --out imputed \
-  --threads 16
-```
-
-Single- vs multi-chromosome SRP is auto-detected. Chromosomes are processed sequentially, with the next one's data prefetched in the background. Target chromosomes absent from the panel (chrY, MT, unplaced contigs) are written as given after the panel's chromosomes, with their own `##contig` lines, like unmatched sites on a panel chromosome (`--drop-unmatched` leaves them out). Every imputed chromosome must have a map (`--map` concatenated, or `--map-dir`), or Selphi errors out early. The multi-chromosome path writes VCF.gz or BCF only (`--parquet`, `--pgen`, `--selfdecode`, `--all-formats` and `--phase-only` are refused; run per chromosome for those) and does not apply GL-aware refinement.
-
-### Low-coverage WGS (`--lcwgs`)
-
-For low-coverage sequencing (uniform 0.5-4× genomes, or capture libraries with a low-pass off-target background), where most sites carry a genotype likelihood rather than a confident call, use the genotype-likelihood-aware engine. Input is a VCF/BCF with the `PL` field (e.g. from `bcftools mpileup | bcftools call`) at the panel's sites. The output holds the input sites whose REF/ALT match the panel and the panel SNPs the file does not list inside its covered span (this engine does not carry the other input records through); a record gets flat likelihoods only when no supported form gives it likelihoods (`PL`, `GL`, likelihoods rebuilt from GQ in an eligible GT:GQ call set, or a reference block):
-
-```bash
-selphi --lcwgs \
-  --refpanel reference.srp \
-  --input target_gl.vcf.gz \
-  --map genetic_map.map \
-  --out imputed \
-  --threads 16
-```
-
-Output is `GT:DS:GP`. A site's dose folds its likelihood with a novel-allele emission of 1e-6 (`LCWGS_NOVEL_EMISSION`; the forward-backward itself keeps 1e-12), so reads that settle an allele none of the copied haplotypes carry are not overruled: on HG003-HG007 chromosome 20 `PL` files, confident true heterozygotes written homozygous reference fell from 124 / 255 / 270 to 37 / 18 / 0 at about 4.8x / 12x / 36x, the <0.5% bin gained 0.004-0.006 R² from 4x up, and 0.5-2x is unchanged within seed noise (0 restores the previous output). Panel SNP sites between a `PL` file's first and last record that it does not list are imputed from flat likelihoods, as `bcftools call -i` would write them (a file that lists them all is unaffected). On chrX, males are haploid outside PAR1/PAR2: they are taken from haploid calls in the input (two-value `PL`, as `bcftools call --ploidy` writes), from `--haploids`, or recognised from their genotype likelihoods (a man shows reads of both alleles outside the PARs only through read errors). There each of a man's two sampled haplotypes is drawn from his one allele's read likelihood, independently of the other, and his genotype posteriors are haploid (no heterozygote). The engine alternates sparse-PBWT haplotype selection with a GL-weighted Li-Stephens forward-backward (a conditional-HL diploid Gibbs sampler) and an eight-founder phasing HMM re-committed at every iteration (`LCWGS_NO_FOUNDER_PHASE=1` reverts to the older diplotype-mosaic segment commitment), processing the chromosome in cM chunks so the full panel is never held in memory. The selected set is capped per sample at `LCWGS_KPBWT` haplotypes (unset: 6.6% of the panel, clamped to 2,000-5,000 and below the panel size, so 2,000 on panels of 2,001 to 30,310 haplotypes); with the default storage-site spacing the union of PBWT neighbours across a chunk covers nearly the whole panel. On panels below 30,311 haplotypes (1000 Genomes size) a run whose likelihoods are soft takes the small-panel profile, said in the log: the cap follows GLIMPSE2's rank order, the per-haplotype rare-carrier augmentation is off, and two Gibbs chains of 20 iterations (15 averaged; seeds 1,000 apart) replace one of 30, their dosages and genotype posteriors averaged; one sample's two chains run at the same time. "Soft" is the coverage gate the SPLIT already uses: the mean over sites of the largest normalised genotype likelihood below `LCWGS_SPLIT_GL_THR` (0.84; true 0.5-2× reads score 0.58-0.73, the ~2.3× genomes 0.75 and the capture libraries 0.53, true 4× reads 0.88-0.89 and 4-30× `PL` files 0.91-1.00). Before it, the haplotype-index cap kept the first 1,000 samples of the panel for every target (on the 6,332-haplotype panel no TSI, GBR, FIN, CDX, GIH or LWK haplotype), and the augmentation, which reached carriers outside them, follows each haplotype's sampled allele and so pushes a chain's dose to all or nothing. At true 0.5-2× (GIAB HG002-HG007, chromosome 22, three regions, three seeds, paired) per-sample R² rose by 0.00057 (95% interval +0.00034 to +0.00081; 65 of 81 sample-seed pairs), R² below 0.5% MAF by 0.0052 (+0.0027 to +0.0081; 26 of 27) and at 0.5-1% by 0.0050, for 20-30% less CPU time; on six ~2.3× genomes (4,478 haplotypes) R² at non-reference truth sites rose by 0.00054 (13 of 18), every frequency bin up. On the six capture libraries (chromosome 22, own pileup, three seeds) non-reference concordance went from 97.952% to 97.970% (+0.018 points, interval -0.029 to +0.065; 11 of 18 pairs higher) and heterozygote precision from 97.450% to 97.579% (+0.129, 18 of 18), but below 0.5% MAF non-reference concordance is 0.21 points lower (88.13% to 87.92%, interval -0.55 to +0.14; 13 of 18 pairs lower): the profile calls fewer rare non-reference genotypes, wrong ones as well as right ones. On chromosomes 20 and 10 (one seed each) non-reference concordance rose by 0.022 and 0.024 points (6 of 6 on chromosome 10) and on chromosome 1 (three seeds) it was 0.008 points lower (interval -0.022 to +0.007; 5 of 18 pairs higher), with heterozygote recall 0.025 lower (no sample higher) and precision 0.096 higher (18 of 18); dosage R² was higher in every frequency bin on all three, and from bcftools likelihoods non-reference concordance rose on chromosomes 22, 20, 10 and 1 (+0.024, +0.052, +0.017, +0.009). The margin over GLIMPSE2 stays positive in every sample on every chromosome. With confident likelihoods the profile was worse (one genome's 4× and 10× `PL` files: R² -0.00010 and -0.00003, 10 and 12 more genotype errors, lower in each of three seeds; 30× level), so such runs keep the previous conditioning byte for byte. `LCWGS_SMALL_PANEL=old` keeps it at any coverage (an explicit `LCWGS_QUAL_TRUNC` or `LCWGS_BIG_PANEL=0` does too); `LCWGS_N_ITER`, `LCWGS_N_MAIN` and `LCWGS_GIBBS_RESTARTS` override their part. On a larger panel the index order keeps whatever block the panel lists first, so there the cap follows GLIMPSE2's rank order by default, said in the log; and when the coverage gate engages the SPLIT pass (soft likelihoods, depth above 3,000), that pass conditions on 2,000 rank-ordered haplotypes plus up to 1,000 rare carriers, exactly the computation of a `LCWGS_KPBWT=2000` run, and supplies the sites of 0.5-10% panel MAF, while sites at or above 10% and below 0.5% keep the main pass (`LCWGS_BIG_PANEL=order` keeps the rank order with the previous SPLIT, 5-10% at the full depth; `LCWGS_BIG_PANEL=0` restores the index order as well). On a 75,552-haplotype panel that lists one large European cohort first (chromosome 22, six GIAB capture libraries) this gives 98.66% non-reference concordance against 97.81% for the index order (12 of 12 sample-seed pairs higher: three seeds on the three European samples, whom the index order suits best, one on the Han Chinese samples; no sample is below the index order in any MAF bin beyond seed noise; the Han Chinese samples, conditioned on European haplotypes only by the index order, gain about 1.5 points overall and 18-20 points below 0.5%), and over three seeds on all six 98.68% against 98.36% for GLIMPSE2 on the same panel (+0.32 points, 18 of 18 pairs higher; at 0.5-5% +0.14 points with a 95% interval of -0.25 to +0.52, 12 of 17 non-tied pairs higher; below 0.5% -0.07, interval -2.28 to +2.14; indels +0.54). The rank order with the previous SPLIT reached 98.62%, 0.75 points below GLIMPSE2 at 0.5-5% (0 of 18 pairs higher). The 0.5% and 10% band edges were chosen on these six samples. On 4x and 30x likelihood (`PL`) files of one European genome it was not below the index order in any of the three MAF bins beyond noise over three seeds (one genome, no confidence interval), with heterozygote precision 0.14-0.18 points lower (the previous SPLIT: 0.06-0.12 lower). `LCWGS_KPBWT=2000` alone (one pass, no SPLIT) reached 98.52% (+0.16 over GLIMPSE2; 17 of 18 pairs higher, one tied) for three quarters of the CPU time (731 against 976 CPU-seconds and 266 against 317 s, chromosome 22, 4 threads), but it lowers the common SNPs of two of the three European samples by 0.09-0.21 points against the index order. For one sample the default's two passes run at the same time and decode the panel half of each selection sweep once for both, the selection decode keeps one prefix array in eight and traces entries back through the others, and the next chunk's selection panel is built while the current chunk runs when the memory left allows it (`LCWGS_NO_PANEL_AHEAD`); the output is the same as running the passes one after the other (`LCWGS_SPLIT_SERIAL=1`: 442 s, 1,188 CPU-seconds; the previous release took 1,135 s and 2,796 CPU-seconds). Its peak memory is 10.2 GiB on chromosome 22 (9.1 GiB with the previous release) and 26.8 GiB on chromosome 1 (one run of HG004: 1,765 s, 5,489 CPU-seconds), set there by the pericentromeric chunk; `LCWGS_CHUNK_MAX_PANEL_GB=16` cuts that chunk and brings chromosome 1 to 14.0 GiB for 1% more wall time, but cutting chunks changes the cut chunks' output with a small negative point estimate (at 8 on chromosome 22, six libraries over three seeds: -0.02 points of non-reference concordance, interval -0.06 to +0.02, 15 of 18 pairs lower), so it is opt-in. Starting the band at 0 (`LCWGS_SPLIT_MAF=0,0.1 LCWGS_SPLIT_KMAX=3000 LCWGS_SPLIT_KPBWT=2000`) also hands the 2,000-haplotype pass the sites below 0.5%: 98.72% (+0.36 over GLIMPSE2; below 0.5% +1.12, interval +0.12 to +2.13, 16 of 17), a gain the Han Chinese samples carry, while the European samples lose 0.1-0.7 points there against the default and the European likelihood files 0.9-1.5 points against the index order; it is opt-in. Three other opt-in settings were measured against the default (six libraries, three seeds; CPU from one library on chromosome 22, 4 threads, each run alone) and none replaced it: `LCWGS_SPLIT_ITERS=20,15` (the 2,000-haplotype pass runs 20 iterations and averages 15) uses 14% less CPU and is not below the default beyond noise overall (+0.002 points, interval -0.005 to +0.009), but its effect within 0.5-10% is unresolved; `LCWGS_SELECT_EVERY=2` (a new selection at every other averaged iteration) uses 10% less CPU but lowers heterozygote precision (-0.03 points, lower in each of the six samples' three-seed means, though over the three seeds the interval is -0.10 to +0.05) and changes the output on 1000 Genomes-size panels as well; `LCWGS_SPLIT_BLEND_BELOW=0.005` (the mean of both passes below 0.5%) raises that bin by 0.52 points (interval -0.10 to +1.15), a gain the Han Chinese samples carry, while HG002 loses there on all three seeds of its 30x likelihood file. The forward-backward is SIMD-accelerated and √n-checkpointed (bit-identical, ~2× faster and ~10× lower peak memory). Against GLIMPSE2 and QUILT2 (three runs each) on GIAB HG002-HG004 at true 0.5, 1, 2 and 4× (chromosome 22, 20-30 Mb; three seeds for Selphi), overall per-sample R² is 0.9733, 0.9849, 0.9903 and 0.9940 against GLIMPSE2's 0.9714, 0.9829, 0.9891 and 0.9934 and QUILT2's 0.9716, 0.9830, 0.9899 and 0.9932, the highest of the three at every depth; below 0.5% MAF Selphi's 0.8229, 0.8531, 0.8959 and 0.9324 lead GLIMPSE2 (0.8230, 0.8549, 0.8951, 0.9261) at 2× and 4× and trail it at 0.5× (by 0.0001) and 1× (QUILT2 0.7938-0.9035). On one capture library (chromosome 22, 16 threads, idle host) the default takes 16.7 s against GLIMPSE2's 32 s, both writing the panel's indels, and six libraries in one run take 70 s against 156.6 s; on a whole chromosome 22 at ~2.3× it takes 16.5 s and 176 CPU-seconds on the 4,478-haplotype panel and 16.6 s on the 6,332-haplotype panel (GLIMPSE2 31.5 s, QUILT2 128 s; that panel has no indels). At 4 threads (linkage off), where one sample leaves threads idle, running the two chains at the same time takes 15.4 s against 20.5 s one after the other (same output) and 24.1 s for the previous conditioning, for 0.88 against 0.60 and 0.71 GiB. Read-pair linkage is on for read input on panels below 30,311 haplotypes, except with `LCWGS_SCAFFOLD` or `LCWGS_NO_FOUNDER_PHASE` (`LCWGS_LINKAGE=0` turns it off and restores the previous output): a read and its mate come from one molecule of one haplotype, but the per-site likelihood lets each of their bases come from either haplotype, which favours "both haplotypes carry the read's alleles" at the heterozygotes a read pair joins. With linkage a fragment's bases enter the forward-backward as one factor over its sites, which are then drawn together, and the founder phaser as diplotype potentials, for samples whose median depth over the SNP sites is at most 3 (`LCWGS_LINK_MAX_DEPTH`) and at sites holding at most 3 bases (`LCWGS_LINK_SITE_MAX_DEPTH`): a deeper site keeps all its bases in errmod, whose correlated-error weights the linked one-base terms lack. On nine held-out sets (GIAB HG002-HG007, chromosome 22, windows outside the sweep's scored 20-30 Mb plus 20-30 Mb for HG005-HG007, three seeds, paired against linkage off) per-sample R² rose by 0.0012, 0.0008 and 0.0004 at 0.5, 1 and 2× (95% intervals +0.0007 to +0.0018, +0.0004 to +0.0012, +0.0002 to +0.0007; 190 of 243 pairs higher); below 0.5% MAF it changed by +0.0025, -0.0002 and -0.0006 and at 0.5-1% by +0.0027, +0.0004 and -0.0010 (intervals spanning zero at 1 and 2×). On the coverage sweep it raised overall R² by 0.0018, 0.0011 and 0.0010 at 0.5-2× (intervals excluding zero), which puts Selphi ahead of QUILT2 there; on six ~2.3× genomes R² at non-reference truth sites rose by 0.0028 (18 of 18; four frequency bins up, 0-0.1% -0.0001); on the six capture libraries (default seed) non-reference concordance rose by 0.09 points on chromosome 22 and by 0.03-0.06 on chromosomes 20, 10, 1 and 15, with heterozygote precision 0.07 points lower and recall 0.17 higher on chromosome 22. Without the site cap, linkage lost about 0.002 R² below 1% MAF at 2× and 0.16 points of heterozygote precision on the capture libraries. It costs 5-11% more CPU time on a whole chromosome 22 at ~2.3× (16 threads, idle host) and none measurable on one capture library; at 4× it is not engaged. Full MAF-binned and multi-coverage numbers are in the manuscript. Expert knobs are exposed via `LCWGS_*` environment variables; the defaults were checked against alternatives on the 0.5-4× genomes.
-
-#### Native BAM/CRAM input
-
-Point `--lcwgs` directly at aligned reads and Selphi computes the genotype likelihoods natively at the panel's sites (no `bcftools mpileup`); with `--bam` the default `--engine auto` picks this engine on its own, so `--lcwgs` is optional. One file per sample; `--bam-list` takes a file with one path per line. CRAM also needs the reference FASTA (with a `.fai`):
-
-```bash
-# Single BAM
-selphi --lcwgs --bam sample.bam --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
-
-# CRAM (needs the reference FASTA used at compression)
-selphi --lcwgs --bam sample.cram --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map --out imputed --threads 16
-
-# Many samples, bounded to a region (with a <file>.bai / <file>.crai index only that region is decoded)
-selphi --lcwgs --bam-list bams.txt --reference GRCh38.fa --refpanel reference.srp --map genetic_map.map \
-  --region chr20:1000000-2000000 --out imputed --threads 16
-
-# Whole genome: a multi-chromosome panel (or --refpanel-dir) runs every chromosome the reads or the PL file cover
-selphi --bam sample.bam --reference GRCh38.fa --refpanel all_chrs.srp --map-dir maps/ --out imputed --threads 16
-```
-
-On a multi-chromosome panel each chromosome runs as its own single-chromosome run (one VCF.gz and one dosage TSV, chromosomes in panel order; each chromosome's records are those of the run made with that chromosome's panel alone, checked on NA24143 chromosomes 20 and 22); a chromosome the input does not cover is left out, and chrY/MT are skipped. `--map` may be one file holding every chromosome, or `--map-dir` a directory of per-chromosome maps. A whole-genome BAM or CRAM with an index is read one chromosome at a time through it.
-
-The pileup is CIGAR-aware and applies the standard mapping/base-quality filters (`LCWGS_MIN_MAPQ`, `LCWGS_MIN_BQ`, `LCWGS_MAX_DEPTH`), collapsing overlapping paired-end mates per site; its GLs use the `bcftools mpileup` error model at the same filters but are not identical by default (supplementary alignments are dropped, and mates are merged per site rather than by htslib's overlap reconciliation, which `LCWGS_OVERLAP_HTSLIB=1` reproduces). Contig names are matched tolerant to the `chr` prefix.
-
-**Pass `--reference` for BAM input too.** With the reference FASTA available, Selphi applies Base Alignment Quality (BAQ) as `bcftools mpileup` does by default: extended BAQ (a re-alignment HMM that caps the quality of bases whose placement near an indel or soft clip is uncertain) on the reads bcftools' partial-realignment heuristic selects. The port is bit-identical to htslib/bcftools 1.22 (verified against `samtools calmd -r -E` on 28,596 reads). Without `--reference` BAQ cannot run and the pileup uses raw base qualities, which gave a smaller mean margin over GLIMPSE2 at low coverage (chr22, six GIAB capture libraries: +0.203 instead of +0.236 percentage points of non-reference concordance), though the paired BAQ effect is not resolved (+0.033 points, 95% interval -0.021 to +0.087). `LCWGS_NO_BAQ=1` disables it (bcftools `-B`); `LCWGS_FULL_BAQ=1` realigns every read (bcftools `-D`, slightly worse than the partial default).
-
-**Speed profile.** The sampler runs 30 iterations by default (5 burn-in, then 25 whose dosages are averaged); under the small-panel profile two chains of 20 (15 averaged) run instead, one sample's two at the same time, sharing each selection sweep's panel decode. On the six capture libraries (chromosome 22, 16 threads, idle host), one sample takes 16.0-18.9 s, 190-219 CPU-seconds and 2.7 GiB with the default impute-only indels; chromosome 1 takes 87 s, 1,066 CPU-seconds and 9.1 GiB (host at load 5-16). All 16 threads work on that sample's forward-backward blocks as they become ready, which costs CPU time: six samples in one run take 71 s and 756 CPU-seconds, 126 per sample, at 8.5 GiB. GLIMPSE2 with its 16 phase chunks run concurrently takes about 32 s, 320 CPU-seconds and 13.7 GiB for one sample and 157 s for six. Twelve samples in one run take 119.5 s, 1,499 CPU-seconds and 9.4 GiB, against 302 s for GLIMPSE2. Chunks and samples are scheduled under a memory budget (`LCWGS_MEM_BUDGET_GB`, default half the machine's RAM).
-
-Indel panel sites carry no read evidence, so with BAM input they are imputed only: they are written with their dosages, but nothing in the sampler reads them (haplotype selection, rare-carrier augmentation, allele sampling and phasing run on the SNPs alone), so the SNP output is exactly what it is without them. Over three seeds on six capture libraries their non-reference concordance was above GLIMPSE2's: 94.46% against 94.10% on a 1000 Genomes panel (+0.36 points, 95% interval +0.01 to +0.71, 16 of 18 sample-seed pairs higher) and 96.10% against 95.88% on the 75,552-haplotype panel with `LCWGS_KPBWT=2000` (+0.21, +0.09 to +0.33, 17 of 18 higher, one tied); 96.43% with that panel's default conditioning (+0.55, 12 of 12 higher). By MAF bin the point estimates are above GLIMPSE2's except below 0.5% with the large panel's default conditioning (-0.16; 5 pairs higher, 3 lower, 4 tied), but several intervals include zero (both panels below 0.5%, the 1000 Genomes panel above 5%, the large one at 0.5-5%). Imputing them costs about 35% more CPU time on a 1000 Genomes-size panel. `LCWGS_BAM_INDELS=drop` leaves them out (SNP dosages only, the previous default); `LCWGS_BAM_INDELS=keep` (or `LCWGS_BAM_KEEP_INDELS=1`) puts them in the sampler with a flat prior (indels and SNPs within noise of impute-only, more memory); `LCWGS_INDEL_REALIGN=1` (needs `--reference`) scores them from the reads with a pair-HMM realignment, which at this depth makes false heterozygotes (in the sampler it cost the SNPs 2.2 points of non-reference concordance).
-
-#### A caller's calls with the reads (`--calls`)
-
-A ~30x genome comes with a variant caller's calls, which miss variants where few reads cover a site and flag calls the caller is unsure of. `--calls` writes the caller's VCF back with Selphi's genotypes from the same reads where the caller is not trusted, in one VCF.gz + `.tbi`:
+For a ~30x genome with its variant caller's VCF: Selphi writes the caller's file back, with its own genotypes
+where the caller has no variant call and the read depth (base and mapping quality 20) is below 20 (`--calls-depth`).
 
 ```bash
 selphi --bam HG002.cram --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map \
   --calls HG002.deepvariant.vcf.gz --out HG002.merged --threads 16
 ```
 
-- **The reads** go through the lcWGS engine exactly as `--lcwgs --bam` (same pileup, same chain, same seed: every Selphi row carries the genotype and posteriors of the plain run), and the same pass over the reads counts the read depth at every panel site by the rules of `samtools depth -a -Q 20 -q 20` (equal to samtools 1.22 at all 2.54 M v3 chr22 positions on three 30x BAMs and a CRAM, with and without an index, BAQ, a region or `LCWGS_OVERLAP_HTSLIB`).
-- **The policy.** A panel allele where the caller has no variant call (nothing, a 0/0, a no-call, a filtered call) goes to Selphi when that depth is below `--calls-depth` (20). A PASS variant call whose GQ is below `--calls-min-gq` goes to Selphi at any depth (default 0: never, see below; a call without FORMAT/GQ never; SNP records only unless `--calls-gq-scope all`). `--calls-gvcf` reads the file as a gVCF, where a position nothing covers is a no-call rather than reference.
-- **Matching.** Caller and panel alleles are compared after the same left-normalisation against the FASTA (`bcftools norm -m -any -f FASTA -c w`; identical to bcftools 1.22 on 1.1 M allele pairs of DeepVariant, GATK and bcftools gVCF calls). `SELPHI_CALLS_WINDOW` (10,000 bp) bounds how far a record may move left and how far the merge looks ahead; a panel indel in a repeat longer than that is never handed to Selphi.
-- **The output** is the caller's file: its header verbatim plus a `##SelphiCalls` provenance line and the merge's FORMAT definitions, its records as read. A Selphi row (`GT:SRC:SDS:SGP:SRD:CST:CAC:CGQ:CPOS:CIDX`, the panel's alleles) is written only where Selphi disagrees with what the caller's file says about that allele; a caller record is replaced whole or not at all (records that share an allele together), and the rows that replace it name it (`CPOS`/`CIDX`); a record compared and kept gets `SRC:SAC:SRD`; gVCF blocks are cut into fragments around Selphi rows (`INFO/SBLK`). Records Selphi cannot restate (symbolic SVs, breakends, `*` alleles, and the records under them) are always kept, whatever their FILTER, and nothing is written over what they assert. Overlapping records and rows are decided together; a result that would contradict itself (a row over a kept call, more than two alleles at a base, anything inside a homozygous Selphi deletion) is resolved again without Selphi's indel rows, which carry no read evidence, and otherwise written as the caller wrote it. The file is written under temporary names and renamed only once complete.
-- **Measured** on GIAB HG002, HG003 and HG004 (30x NovaSeq, chromosome 22, DeepVariant 1.0 calls, the 75,552-haplotype panel, default policy): the SNPs score exactly as the evaluation-side merge they were designed from, in every depth bin (GIAB v4.2.1 non-reference concordance 0.98976 -> 0.99163, 0.98869 -> 0.99039 and 0.98810 -> 0.99008; net +77, +71 and +76 SNPs: truth genotypes recovered minus new errors and new false positives against DeepVariant alone; v5.0q HG002 +39). Indels: +13, +18 and +9 (that merge +13, +19, +12) on v4.2.1 and +49 (+41) on v5.0q: the indel rows that merge wrote over the caller's own calls, and that are left out here to keep the file coherent, held 0, 1 and 3 of its recovered indels on v4.2.1, and on v5.0q 24 of its false positives and 16 of its recovered indels. HG004's 3, all at depth 15-19, are more than the spread of HG002's chain seeds (1): an open defect of the default. Cost: the run is the plain `--lcwgs --bam` run plus a 0.5 s merge (HG002, 4 threads, four runs each: 266-270 s, 696-702 CPU-seconds and 9.22-9.23 GiB with `--calls`, 267-269 s, 699-703 CPU-seconds and 9.21 GiB without); a run without `--calls` is unchanged, output and cost.
-- **`--calls-min-gq` was measured and stays off.** A rule fixed before the runs picked the best of G 0, 5, 10, 15, 20 x scope snp/all on HG002 (GIAB v4.2.1), `--calls-min-gq 15 --calls-gq-scope all`, and checked it on seven more sets (HG003, HG004, two more HG002 chain seeds, GIAB v5.0q). Against the default it gained 29-56 SNPs + indels net on all eight (paired 1-Mb block-bootstrap 95% CI above 0 on six; on v5.0q seeds 1 and 2 [-5, +104] and [-12, +103]): 22-46 SNPs, 163 of the 245 over the eight at depth >= 20 (on HG003 22 of 46), where the default changes nothing and the gain is mostly DeepVariant's low-GQ false calls removed (HG002 v4.2.1 SNP precision 0.99693 -> 0.99771, recall 0.99574 -> 0.99567), and indels at depth >= 20 on every set. It was not adopted because at depth 15-19 its indel net fell below the default's on five of the seven sets, on four by more than the registered per-bin tolerance (3 sites: the spread of HG002's chain seeds, floored at 3; GIAB v5.0q new indel false positives there 35-36 -> 49-52); unlike the default it also overwrites correct calls (HG002 v4.2.1 11 SNPs and 8 indels, v5.0q 38 and 138). For a file without FORMAT/GQ (bcftools `call --gvcf`) the setting changes nothing (records identical to the default's). With unfiltered GATK4 calls (HG002, one seed) it raised the net +93 -> +102 SNPs and +25 -> +35 indels (v4.2.1; v5.0q indels +258 -> +417). Descriptively (per panel key, without the coherence rules), replacing every DeepVariant PASS call of GQ 0-9 by Selphi's genotype nets +16 to +44 SNPs and +5 to +31 indels on the four sample/truth sets, of GQ 10-19 -32 to +5 and of GQ 20-29 -29 to +3 (per type and set); no threshold other than 15 was confirmed. The intervals are conditional on each sample and chain seed (the selection set's ignores the selection); HG003 and HG004 are HG002's parents; all of it is one chromosome, one ancestry, one library and DeepVariant 1.0, and fills outside the GIAB benchmark regions are unscored.
-- **Limits.** One sample (one BAM/CRAM whose read groups name one sample, one sample column; the caller's sample name is the output's); a text VCF (BCF is refused); `--reference` required; VCF.gz output only. The SelfDecode ETL classifies the file by the caller's header, which is kept: do not add the `v3.reference.bcf` header line to a merged WGS file. PLINK 2 (2.0.0a6.9) imports the GT calls directly; `dosage=SDS` needs the multi-allelic caller records split first (`bcftools norm -m -any`), then it reads SDS on every Selphi row and the GT count elsewhere.
+One sample per run; add `--calls-gvcf` when the calls are a gVCF. The output is one VCF.gz with its index.
 
-### Memory-bounded mode (biobank-scale)
+### Exomes and variant-only VCFs
 
-For panels where memory is the binding constraint, `--sample-batch-size N` processes target samples in batches of N. Peak memory scales with the batch size, at ~30-40% wall overhead. Batching turns off the two-member phase ensemble (as `SELPHI_DIPLOID_INTRA_N=1`) and the phasing replicas, so dosages differ slightly from a non-batched run; with `--keep-input-phase` a phased input's output equals the non-batched run's. Per-batch intermediates go to `$TMPDIR` (default `/tmp`); point it at a volume with room.
+A single deep genome whose VCF lists only its variant sites is recognised: the panel sites it leaves out within
+the span of its records are read as reference calls (flagged `IMP` in the output); long gaps are imputed. For an
+exome or a targeted panel, give the regions the caller covered with `--callable targets.bed`. gVCF reference blocks
+are read as reference calls.
 
-```bash
-selphi \
-  --refpanel topmed.srp \
-  --input cohort.vcf.gz \
-  --map genetic_map.map \
-  --out imputed \
-  --bcf \
-  --sample-batch-size 100 \
-  --threads 16
-```
-
-Supported for all output formats, which can be combined (e.g. `--bcf --parquet --pgen --sample-batch-size 100`); each format has its own per-batch writer and native sample-merger.
-
-A WGS-density genotype input (hundreds of thousands of called sites per chromosome) is imputed in windows of at most 100,000 typed sites (`SELPHI_WINDOW_MAX_MARKERS`), because a window's copying weights are held for every typed site until it is interpolated. One 30× sample on chromosome 22 (918,000 called sites, 4,478-haplotype panel) peaks at 6.7 GB in these windows, against 51 GB in 80-cM windows, with the same R².
-
-### Reference panel preparation
-
-Create an SRP reference panel from VCF, BCF, or BREF3 (source format auto-detected). The `.srp` is written next to the source by default (`panel.bcf` → `panel.srp`).
+### Phasing a cohort without a panel
 
 ```bash
-# From BCF (fastest: parallel native BCF reader, 16 threads)
-selphi --prepare-reference-from panel.bcf --threads 16
-
-# From VCF.gz / BREF3
-selphi --prepare-reference-from panel.vcf.gz
-selphi --prepare-reference-from panel.bref3
-
-# Explicit output path + custom chunk size
-selphi --prepare-reference-from panel.bcf --out custom_name.srp --chunk-size 10000
+selphi --phase-panel --input cohort.vcf.gz --map chr22.map --out panel --srp --threads 16
 ```
 
-| Source | Index required | Notes |
+Phases a cohort against itself and writes `panel.vcf.gz`; `--srp` and `--bref3` also write it as a reference panel.
+An indexed BCF of 16,000 or more samples is read in chunks; `--region chr22:16000000-20000000` phases one region
+(in memory).
+
+### Large cohorts
+
+`--sample-batch-size 100` imputes the samples 100 at a time, which bounds the memory of the imputation (reading
+and phasing still see the whole cohort). Batching averages over one phasing instead of two, so dosages differ
+slightly from an unbatched run. Temporary files go to `$TMPDIR` (default `/tmp`).
+
+### Reference panels
+
+```bash
+selphi --prepare-reference-from panel.chr22.bcf --threads 16           # BCF (with .csi), VCF.gz or BREF3 -> .srp
+selphi --merge-srps-dir srps/ --out all_chromosomes                    # per-chromosome .srp -> one file
+selphi --prepare-reference-from panel.srp --out panel.bcf --threads 16  # .srp or .bref3 -> BCF or VCF.gz
+```
+
+A BCF is read in parallel with constant memory; a VCF.gz is loaded into memory first.
+
+### Accuracy evaluation
+
+```bash
+selphi --refpanel panel.chr22.srp --input array.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz
+selphi --evaluate imputed.vcf.gz --truth truth.vcf.gz --out eval
+```
+
+Reports R² and concordance per site and per sample, by minor allele frequency, as text and JSON. Useful options:
+`--exclude-sites array.vcf.gz` (score imputed sites only), `--exclude-panel-monomorphic panel.srp`,
+`--homref-absent on` (sites absent from the truth count as reference), `--by-type` (SNPs and indels apart).
+Low-coverage output is scored with `--evaluate`.
+
+`selphi --index file.vcf.gz` builds a `.tbi` (`.csi` for a BCF). After building, `selphi --self-test` checks every
+output path on a small single-chromosome panel:
+
+```bash
+selphi --self-test --refpanel panel.chr22.srp --input target.vcf.gz --map chr22.map --out selftest --truth truth.vcf.gz
+```
+
+## Output
+
+| Option | Format | Per sample |
 |---|---|---|
-| `.bcf` | `.bcf.csi` | Parallel regional reads via CSI index; multi-contig supported; constant (<500 MB) memory. |
-| `.bref3` | none | Native BREF3 reader (ported from Java). |
-| `.vcf.gz` | none | Streamed line by line (single chromosome) into an in-memory phased panel, then scattered to the SRP; peak memory scales with the panel. For whole-genome / very large panels prefer `.bcf` (streaming, constant memory). |
+| *(default)* | VCF.gz + `.tbi` | `GT`, `DS`, `AP1`, `AP2` |
+| `--bcf` | BCF, instead of VCF.gz | `GT`, `DS`, `AP1`, `AP2` |
+| `--parquet` | Apache Parquet | `DS` |
+| `--pgen` | PLINK 2 PGEN | hard call and dosage |
+| `--selfdecode` | ZIP of per-sample Parquet | `GT`, `AP1`, `AP2` |
 
-All three sources give the same panel and the same imputed dosages (the `.srp` files differ only in header `##contig` lines and chunk layout). For whole-genome panels, build a single multi-chromosome SRP from a directory of per-chr files, or merge existing per-chr SRPs:
+These formats are for the array and sequencing-call engine; they can be combined in one run and carry the same
+dosages, up to each format's precision. Parquet, PGEN and SelfDecode need a single-chromosome run. Low-coverage
+runs write a VCF.gz (`GT`, `DS`, `GP`) and a dosage table.
 
-```bash
-selphi --prepare-reference-from /path/to/bcfs/ --out all_chromosomes --threads 16   # directory of per-chr BCFs
-selphi --merge-srps-dir /path/to/srps/ --out all_chromosomes                        # merge per-chr SRPs
-```
+| Field | Meaning |
+|---|---|
+| `GT` | genotype: phased, except in low-coverage output |
+| `DS` | dosage: expected number of ALT alleles (0-2) |
+| `AP1`, `AP2` | probability of the ALT allele on haplotype 1 and 2 (`--no-ap` leaves them out) |
+| `GP` | genotype probabilities (low-coverage runs; with `--gp` for the others) |
+| `INFO/DR2` | estimated imputation accuracy of the site |
+| `INFO/IMP` | the site was not in the input |
 
-Variants with an allele of 255 bytes or more (structural-variant alleles) are kept: the variant index stores their lengths escaped, and such a panel carries a distinct format signature, so Selphi builds that predate long-allele support refuse it rather than misread it; a panel without long alleles is written exactly as before.
+Sites typed in the input keep their calls and carry `GT` only; a missing call there is imputed.
 
-#### Decode a panel back to VCF / BCF
+## Main options
 
-A `.bref3` or `.srp` panel can be decoded straight to phased VCF.gz or BCF — a fast,
-multithreaded native replacement for Beagle's `unbref3` (no Java, no external converter).
-The direction is selected by the output extension: a `.bref3`/`.srp` source with a
-`.vcf.gz` or `.bcf` output decodes instead of building a panel.
+| Option | Meaning |
+|---|---|
+| `--refpanel FILE` | reference panel (`.srp`) |
+| `--input FILE` / `--bam FILE` | target genotypes (VCF/BCF) or aligned reads (BAM/CRAM) |
+| `--map FILE` / `--map-dir DIR` | genetic map(s), PLINK format |
+| `--out PREFIX` | output prefix |
+| `--threads N` | threads (default: all) |
+| `--reference FASTA` | reference genome, for CRAM and read input |
+| `--phase-only` | phase without imputing |
+| `--bcf`, `--parquet`, `--pgen`, `--selfdecode` | output formats |
+| `--truth FILE` | score the result against true genotypes |
+| `--seed N` | random seed for phasing (default 33) |
 
-```bash
-selphi --prepare-reference-from panel.bref3 --out panel.bcf    --threads 16   # BREF3 → BCF (fastest)
-selphi --prepare-reference-from panel.bref3 --out panel.vcf.gz --threads 16   # BREF3 → VCF.gz
-selphi --prepare-reference-from panel.srp   --out panel.bcf    --threads 16   # SRP   → BCF
-```
+`selphi --help` lists the other options.
 
-The decoder streams one bounded batch at a time and runs as a three-stage pipeline (panel
-read → per-record formatting → BGZF compression), so peak memory stays below 1.5 GB
-regardless of panel length, and the output is coordinate-sorted, phased, and indexed
-(`.csi`/`.tbi`). On a 75,552-haplotype panel (37,776 samples × 2.58 M chr21 variants) BREF3 → BCF
-runs in ≈2.8 min (BREF3 → VCF.gz ≈6 min); an SRP → BCF → SRP → BCF round trip reproduces the genotype matrix exactly.
+## Performance
 
-## Output formats
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/speed_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/speed_light.svg"/>
+    <img src="img/speed_light.svg" alt="Whole-genome phasing and imputation of 6 samples against a 75,552-haplotype panel on 16 threads: 11.5 min for Selphi 2 and 29.1 min for Beagle 5.5; peak memory 5.0 GB and 45.3 GB" width="720"/>
+  </picture>
+</p>
 
-Selphi supports five output formats. Formats are additive: combine any flags to produce multiple outputs in a single pass (interpolation runs once, encoding fans out to all active formats). `--bcf` replaces VCF; the rest are additive. `--all-formats` enables VCF + Parquet + PGEN + SelfDecode. A run whose output would be one of its input files (the same path, or a symlink to it) is refused before anything is written. Parquet, PGEN and SelfDecode are single-chromosome only, and the low-coverage engine always writes `<out>.vcf.gz` (`GT:DS:GP`, INFO `AF`, panel contig spelling and variant IDs, with its `.tbi`) plus `<out>.dose.tsv.gz` and ignores these flags.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="img/lcwgs_dark.svg"/>
+    <source media="(prefers-color-scheme: light)" srcset="img/lcwgs_light.svg"/>
+    <img src="img/lcwgs_light.svg" alt="Per-sample R² of low-coverage imputation from aligned reads at 0.5, 1, 2 and 4x for Selphi 2, GLIMPSE2 and QUILT2" width="720"/>
+  </picture>
+</p>
 
-| Flag | Format | Content | Best for |
-|---|---|---|---|
-| *(default)* | VCF.gz | GT, DS, AP1, AP2 per sample | Standard bioinformatics, bcftools |
-| `--bcf` | BCF 2.2 | GT, DS, AP1, AP2 per sample | Fast downstream parsing, no external deps |
-| `--parquet` | Apache Parquet (zstd) | DS per sample, variant-major | Data science, Polars/DuckDB |
-| `--pgen` | PLINK2 PGEN | Hardcall (2-bit) + dosage (16-bit) | GWAS with plink2 |
-| `--selfdecode` | ZIP of per-sample Parquet | GT, AP1, AP2 per sample | SelfDecode ETL pipeline |
-
-```bash
-selphi --refpanel ref.srp --input input.vcf.gz --map map.map --out result               # VCF.gz (default)
-selphi --refpanel ref.srp --input input.vcf.gz --map map.map --out result --bcf          # native BCF (replaces VCF)
-selphi --refpanel ref.srp --input input.vcf.gz --map map.map --out result --bcf --parquet --selfdecode
-selphi --refpanel ref.srp --input input.vcf.gz --map map.map --out result --all-formats
-```
-
-Dosages are identical across formats up to each format's precision (VCF `DS` is rounded to three decimals, PGEN stores steps of 1/16384, BCF/Parquet/SelfDecode store 32-bit floats). Hardcalls differ by design: PGEN rounds the summed dosage (the PLINK convention), while VCF/BCF/SelfDecode GT use a per-haplotype argmax; they agree on confident calls and can differ only on borderline per-hap probabilities (chip sites never).
-
-### Target sites absent from the panel
-
-A target record whose `(POS, REF, ALT)` matches no panel site cannot be phased against the panel or imputed, but it is part of the input, so by default Selphi writes it to the output at its position, exactly as given: ID, REF, every ALT, and each sample's GT with its allele indexes, separator (`/` or `|`) and ploidy. QUAL, FILTER and INFO are `.`, which sets these records apart from the panel sites (FILTER `PASS`) and leaves the output header unchanged. The log says how many there were. `--drop-unmatched` leaves them out, as Beagle and most imputation tools do.
-
-This holds for whole-genome runs, `--phase-only` and `--sample-batch-size`. VCF, BCF and SelfDecode carry every such record; Parquet and PGEN, which hold one ALT dosage per row, carry the biallelic ones (DS = the ALT allele count, missing for a no-call). The records are read in a second pass over the target, limited to the run's chromosome through its `.tbi`/`.csi` index when there is one; a matched site is recognised from its position and alleles without decoding its genotypes, so the pass costs little.
-
-### Output fields
-
-Imputed sites from the genotype (chip/WGS) engine carry the following fields (VCF/BCF):
-
-| Field | Scope | Description |
-|---|---|---|
-| `DR2` | INFO | Dosage R-squared: estimated per-variant imputation accuracy (0.0-1.0), Beagle's per-haplotype estimator, defined for a single sample (where it is 1 at a confident heterozygote and 0 at a homozygote) |
-| `AF` | INFO | Alternate allele frequency |
-| `AC` | INFO | Alternate allele count |
-| `AN` | INFO | Total allele number |
-| `IMP` | INFO | Flag: a site absent from the input. A site in the input carries no `IMP`, even where a sample's call is missing (that sample gets the imputed value, the others keep their call) or every sample's is. A site a variant-only input left out, or a gVCF block covers, and Selphi read as reference (see [Variant-only and exome VCFs](#variant-only-and-exome-vcfs)) is written as its 0/0 call with `IMP` (VCF, BCF, Parquet; not under `--sample-batch-size`) |
-| `GT` | FORMAT | Best-guess phased genotype |
-| `DS` | FORMAT | Dosage: expected alternate allele count (0.0-2.0) |
-| `AP1` | FORMAT | Haplotype 1 alternate allele probability |
-| `AP2` | FORMAT | Haplotype 2 alternate allele probability |
-| `GP` | FORMAT | With `--gp` only: genotype probabilities `[(1-AP1)(1-AP2), AP1(1-AP2)+(1-AP1)AP2, AP1·AP2]` (the two haplotypes taken as independent) |
-
-Use `--no-ap` to omit AP1/AP2 (smaller, faster output). `--gp` adds `GP` after them (VCF, BCF; also with `--no-ap`, `--sample-batch-size` and whole-genome runs). In VCF text it is written at DS's three decimals, rounded so that the three values sum to exactly 1 and `DS = GP[1] + 2·GP[2]` holds exactly in the written digits; BCF stores float32 values, each in [0, 1] (an AP that interpolation leaves a few millionths above 1 is read as 1). Male chrX is written diploid outside the PARs too, so a man's `GP` there has three values and `GP[1]` is the probability that his two haplotypes differ, not of a heterozygote. It is off by default because it enlarges the file; Parquet, PGEN and SelfDecode output do not carry it, the lcWGS engine always writes its own `GP`, and `--phase-only` / `--phase-panel` (GT only) ignore it. `--header-line '##key=value'` (repeatable) adds lines to the header of every VCF/BCF result (panel decodes included), right after `##source` and in the order given, for a downstream loader that recognises files by a header line. A line is refused before the run starts when it is one Selphi writes itself (`##fileformat`, `##INFO`, `##FORMAT`, `##FILTER`, `##contig`, a `##source` naming Selphi), when its structured value (`<key=value,...>`) is one htslib would not read back exactly as written (an unclosed `<` or quote, a space around a key or value, text after `>`, an `IDX` key), or when it repeats another `--header-line` (the same line, or the same key and `ID`), which VCF readers would drop. A single-chromosome panel's `##contig` line has no length, so neither has the result's; `--contig-length-from-input` writes there the length the input's header declares for that contig (VCF, VCF.gz or BCF input; the contig keeps the name it is written with, an input `chr22` gives `22` its length and the other way round, and a length the panel declares is replaced by the input's). A contig the input declares without a length, or does not declare, is written as without the flag; so is one whose declared length is below the panel's last position (a single-chromosome run checks it), and the run log says which. It covers imputation (including `--sample-batch-size` merges and whole-genome runs), `--phase-only`, lcWGS from a PL VCF/BCF and `--phase-panel` from a VCF; the `.tbi`/`.csi` Selphi writes are built on the file as written. Genotyped (chip) sites that are in the panel keep their input genotypes (phased by Selphi when the input was unphased); in VCF/BCF they carry `GT` and INFO `AF`/`AC`/`AN` only, with no `DS`. Parquet output is variant-major with one `DS` column per sample; SelfDecode output is `<out>.selfdecode.zip`, per-sample chunked Parquet (`{sample}/chrom={chr}/{chunk}.parquet`; a single-sample run has no sample directory).
-
-## Accuracy evaluation
-
-Built-in imputation accuracy evaluation against WGS truth genotypes: per-site and per-sample R², concordance, and MAF-binned metrics. The matched-sites path streams both files, in parallel by region through each file's `.csi`/`.tbi` index (built in memory when a file has none; nothing is written next to the inputs); the hom-ref path holds the truth in memory.
-
-On the matched-sites report the OVERALL row's three numbers cover different sites: N counts every matched site, the mean R² is over the sites in the MAF bins only (MAF ≥ 0.05%, R² defined), the concordance over the sites with a scored sample; the line under the row gives the last two counts.
-
-```bash
-# Inline: add --truth to evaluate automatically after imputation (writes result.eval.json)
-selphi --refpanel reference.srp --input chip.vcf.gz --map genetic_map.map --out result --truth wgs_truth.vcf.gz
-
-# Whole-genome: the same inline flag on either multi-chromosome path
-selphi --refpanel all_chrs.srp --input whole_genome.vcf.gz --map-dir maps/ --out result --truth wgs_truth.vcf.gz
-
-# Standalone: evaluate an existing imputed file
-selphi --evaluate imputed.vcf.gz --truth wgs_truth.vcf.gz --out eval_results
-
-# Standard imputation-R² convention (reproduces the field-standard scoring): absent-from-truth
-# sites count as hom-ref, raw-but-quality-filtered calls are excluded (not scored as hom-ref),
-# the typed/chip sites and the sites monomorphic in the reference panel (unimputable by any
-# tool) are excluded, and the report is split SNP vs indel.
-selphi --evaluate imputed.vcf.gz --truth wgs_truth.strong.vcf.gz \
-       --truth-raw wgs_truth.raw.vcf.gz --exclude-sites chip.vcf.gz \
-       --exclude-panel-monomorphic reference.srp \
-       --homref-absent on --by-type --out eval_results
-```
-
-When `--truth-raw` is given, the report says what it did: raw sites loaded, scored sites matched by
-key, and genotypes rescued from hom-ref scoring (JSON: `truth_raw_diag`). A raw truth acts only where
-the filtered truth has no alt call for a sample but the raw truth does, so zero rescues is a normal
-result — it means the filtered truth already holds every alt call at the scored sites — and the counts
-distinguish that from a raw file that simply does not overlap the scored sites.
-
-Whenever hom-ref scoring runs (`on`, or `auto` on a variant-only truth) the report also carries a
-per-MAF-bin breakdown (printed, and written to the JSON under `maf_bins` alongside `overall_site_r2`).
-Bin MAF comes from the truth genotypes of the scored samples, so the finest resolvable bin is one
-allele copy among them — `1/(2·n_scored)`, e.g. 0.48% with 105 scored samples, below which the bins
-are structurally empty.
-
-By default `--homref-absent auto` reads the genotypes of the truth's first 4,000 records (VCF or
-BCF): a complete callset (a reference call, every allele `0`: `0/0`, `0|0`, a haploid `0`) scores
-matched sites only (legacy), while a variant-only truth scores absent sites as hom-ref (the standard
-imputation-R² convention); the log says which it found. Contig names are matched tolerant to the `chr` prefix (so `22` ≡ `chr22`),
-and only samples shared between the imputed and truth files are scored. On the hom-ref path sites are
-keyed by contig, position and alleles, so one whole-genome truth scores a multi-chromosome run in a
-single pass; the matched-sites path merges one contig at a time, so score per chromosome there. `--truth-raw` takes the
-unfiltered truth: a site a sample carries in the raw call set but not in the quality-filtered `--truth`
-is dropped for that sample rather than mis-scored as hom-ref. `--exclude-sites` takes the array VCF (with its sample columns) and removes the typed sites, so only
-imputed variants are scored; `--exclude-panel-monomorphic` removes the sites no tool can impute. In this mode sites are matched on exact
-`(contig, pos, REF, ALT)`, so the truth and imputed files must share allele representation
-(left-aligned, same REF/ALT orientation); give a truth split to biallelic records and normalized the
-same way as the panel (e.g. `bcftools norm -m -any -f ref.fa`): multi-allelic truth records are skipped,
-so their carriers would otherwise be scored as hom-ref.
-
-| Metric | Scope | Description |
-|---|---|---|
-| R² | per-site | Pearson correlation squared between imputed dosage and truth genotype |
-| Concordance | per-site | Fraction of samples with matching hardcall genotype |
-| R² | per-sample | Pearson correlation squared across all variants for one sample |
-| Concordance | per-sample | Fraction of variants with correct hardcall for one sample |
-
-Dosages are compared in diploid-equivalent units: a haploid call (e.g. a male's non-PAR chrX truth `1`) counts as two copies, so a haploid truth and a diploid-coded imputation of the same man are on one scale. `DS` is read in the sample's own ploidy by default; `--eval-imputed-ds-scale diploid` / `--eval-truth-ds-scale diploid` declare a file whose `DS` is already on the 0–2 scale, and `--eval-imputed-ploidy` / `--eval-truth-ploidy` give the ploidy when a file carries `DS` without `GT`.
-
-Per-sample concordance is reported on the matched-sites path; the hom-ref path reports per-sample R² and per-bin site R² and concordance. MAF bins follow the standard set (0.05-0.1% through 20-50%). The matched-sites path also reconciles indel normalization and REF/ALT swaps; the hom-ref path needs the same representation in both files. For phasing switch-error rate, use `bcftools +trio-switch-rate` with a trio pedigree.
-
-## Indexing
-
-Build a TBI or CSI index natively (no bcftools), or inspect a file:
-
-```bash
-selphi --index output.vcf.gz      # creates .tbi
-selphi --index output.bcf         # creates .csi
-selphi --index-stats output.bcf   # format, size, samples/variants, fields, per-contig ranges
-```
-
-## Self-test
-
-Verify the code paths after building (phase-only, every output format, pre-phased input with and without `--keep-input-phase`, index readability, and evaluation when `--truth` is given). It runs eight full passes, so point it at a small single-chromosome panel:
-
-```bash
-selphi --self-test --refpanel panel.srp --input target.vcf.gz --map chr.map --out test_prefix --truth truth.vcf.gz
-```
-
-## CLI reference
-
-| Option | Description | Default |
-|---|---|---|
-| **Imputation** | | |
-| `--refpanel PATH` | Reference panel in SRP format | required |
-| `--input PATH` | Input VCF/BCF with target samples | required |
-| `--map PATH` | Genetic map in PLINK format: the run's chromosome, or a genome-wide file (only that chromosome's rows are read); `a,b,c` joins files of one chromosome; with a multi-chr `.srp`, `--map-dir` can replace it | required |
-| `--out PATH` | Output path prefix | required |
-| `--threads N` | Number of threads | all CPUs |
-| `--truth PATH` | Truth VCF/BCF; auto-runs post-hoc evaluation after chip/WGS imputation (single-chr and multi-chr alike; the lcWGS engine does not, score its output with `--evaluate`) | |
-| `--engine ENGINE` | Imputation engine: `auto` (default, sniffs the target), `lcwgs`, `genotype`, or `refine` | `auto` |
-| `--phase-only` | Output phased haplotypes only (skip imputation) | off |
-| `--force-phasing` | Re-phase a phased input and do not use its phase (see [Phased input](#phased-input)) | off |
-| `--keep-input-phase` | Impute a phased input on its own phase, without phasing | off |
-| `--trust-input-phase` | Re-phase a phased input and keep every sample's own phase as ensemble member 0 (no agreement check) | off |
-| `--allele-match MODE` | Target/panel allele reconciliation: `none`, `swap`, `strand`, `full` | `swap` |
-| `--lcwgs` | Legacy alias for `--engine lcwgs`; also enables PL/BAM low-coverage input | off |
-| `--bam PATH` / `--bam-list PATH` | Aligned reads for `--lcwgs` (single file, or a list) | |
-| `--reference PATH` | Reference FASTA (required for CRAM input; enables BAQ for BAM input) | |
-| `--calls VCF` | The sample's variant caller VCF (text, plain or bgzipped): write it back with Selphi's genotypes where the caller is not trusted (see [A caller's calls with the reads](#a-callers-calls-with-the-reads---calls)); needs `--bam` and `--reference` | |
-| `--calls-gvcf` | The calls are a gVCF: a position nothing covers is a no-call | off |
-| `--calls-depth T` | A panel allele where the caller has no variant call goes to Selphi when the q20 read depth is below T | 20 |
-| `--calls-min-gq G` / `--calls-gq-scope snp\|all` | A PASS variant call with GQ below G goes to Selphi at any depth (SNP records only, or every record) | 0 / `snp` |
-| `--chrx-no-par` / `--build B` | Treat chrX males as haploid over the whole chromosome instead of diploid in PAR1/PAR2 (male chrX output stays diploid either way); `B` = PAR coordinates, `grch38`/`grch37`/`auto` | off / `auto` |
-| `--no-ap` | Omit AP1/AP2 fields from output | off |
-| `--gp` | Add FORMAT/GP (from AP1/AP2) to imputed VCF/BCF records | off |
-| `--header-line TEXT` | Add a `##key=value` line to every VCF/BCF result header (repeatable; `##fileformat`, `##INFO`, `##FORMAT`, `##FILTER`, `##contig`, a `##source` naming Selphi, malformed `<...>` values and repeats refused) | none |
-| `--contig-length-from-input` | Write in each `##contig` line of the VCF/BCF result the length the input's header declares for that contig (`##contig=<ID=22>` becomes `##contig=<ID=22,length=50818468>`; `chr22` and `22` match each other; a contig the input declares without a length is written as without the flag) | off |
-| `--drop-unmatched` | Leave out the target records that match no panel site (by default they are written as given) | off |
-| `--input-filter MODE` | A record whose FILTER is set and not `PASS`: `auto` reads its calls as no-calls and its likelihoods as given; `missing` also flattens its likelihoods; `keep` reads it as given (see [Filtered records](#filtered-records)) | `auto` |
-| `--callable BED` | Regions the input's caller covered: panel sites inside them that the input does not list are read as reference homozygotes (see [Variant-only and exome VCFs](#variant-only-and-exome-vcfs)) | none |
-| `SELPHI_VARIANT_ONLY_FILL=0` (environment) | Impute the sites a deep single-sample variant-only file leaves out, instead of reading them as reference | on |
-| `--bcf` | Write native BCF output (replaces VCF) | off |
-| `--parquet` | Write Apache Parquet output (additive) | off |
-| `--pgen` | Write PLINK2 PGEN output (additive) | off |
-| `--selfdecode` | Write SelfDecode ZIP output (additive) | off |
-| `--all-formats` | Write all formats (VCF + Parquet + PGEN + SelfDecode) | off |
-| `--debug` | Enable verbose diagnostic output | off |
-| **Accuracy evaluation** | | |
-| `--evaluate PATH` | Evaluate imputed VCF/BCF against truth (standalone mode) | |
-| `--truth PATH` | Truth VCF/BCF with WGS genotypes | |
-| `--homref-absent MODE` | Absent-from-truth handling: `auto`, `on` (absent→hom-ref, standard imputation-R²), `off` (matched sites only) | `auto` |
-| `--truth-raw PATH` | Unfiltered truth; a site carried in raw but not in `--truth` is dropped for that sample (not scored as hom-ref) | |
-| `--exclude-sites PATH` | VCF/BCF of sites to exclude from scoring (e.g. the typed/array sites) | |
-| `--exclude-panel-monomorphic SRP` | Also exclude every site monomorphic in this panel (pass the panel the imputation used) | |
-| `--eval-imputed-ds-scale native\|diploid` | Units of the imputed file's `DS`: allele copies in the sample's ploidy, or already 0–2 | `native` |
-| `--eval-truth-ds-scale native\|diploid` | The same for `--truth` / `--truth-raw` | `native` |
-| `--eval-imputed-ploidy N` / `--eval-truth-ploidy N` | Ploidy for calls whose `GT` does not give it (DS-only files) | |
-| `--by-type` | Also break the report into SNP vs indel (combined total always reported) | off |
-| **Indexing** | | |
-| `--index PATH` | Build TBI/CSI index for a VCF.gz or BCF file | |
-| `--index-stats PATH` | Show file statistics and per-contig genomic ranges | |
-| **Multi-chromosome** (VCF.gz/BCF output only) | | |
-| `--refpanel-dir DIR` | Directory with per-chr SRP files (auto-merges into a temp multi-chr SRP, then runs the multi-chr orchestrator); requires `--map-dir` | |
-| `--map-dir DIR` | Directory with per-chr genetic maps (auto-discovers common naming patterns); alternative to `--map` for a multi-chr `.srp`, required with `--refpanel-dir` | |
-| `--merge-srps PATHS` | Merge SRP files (comma-separated); auto-detects per-chr (multi-chromosome) vs same-chr (horizontal) merge | |
-| `--merge-srps-dir DIR` | Merge all SRP files in a directory into one multi-chromosome SRP | |
-| **Panel phasing** | | |
-| `--phase-panel` | De-novo phase a cohort against itself (no reference); input VCF.gz, .srp, or .bref3 | off |
-| `--srp` / `--bref3` | (with `--phase-panel`) also emit a native `.srp` / `.bref3` reference panel | off |
-| `--region REG` | Restrict to `chr:start-end`: with `--phase-panel` phasing, with `--bam`/`--bam-list` the decoded region; ignored elsewhere | |
-| `--chunk-vars N` | (with `--phase-panel`) override the auto chunk size (variants/chunk) | 0 |
-| **Reference panel** | | |
-| `--prepare-reference-from PATH` | Create SRP from VCF.gz, BCF, BREF3, or a directory of per-chr files | |
-| `--chunk-size N` | Chunk size for SRP creation (0 = auto) | 0 |
-| **Testing** | | |
-| `--self-test` | Run all output format and code path tests | off |
-| **Advanced** | | |
-| `--seed N` | Random seed for chip/WGS phasing and `--phase-panel` (the lcWGS engine uses `LCWGS_SEED`) | 33 |
-| `--est-ne N` | Effective population size (0 = auto) | 0 |
-| `--p-err F` | Fixed emission error floor. Without it the floor starts at 0.025 and is raised per haplotype on arrays with genotyping errors (`SELPHI_PERR_FIXED=1` keeps 0.025) | adaptive |
-| `--match-length N` | Minimum PBWT match length | auto |
-| `--max-candidates N` | Max PBWT candidates per haplotype (0 = auto: the whole panel up to 16,000 haplotypes, above that scaled by panel diversity, at least 2,500) | 0 |
-| `--max-cond-haps N` | Max conditioning haplotypes per diploid phasing window (0 = unlimited, IBS-selected; try 120-200 for faster phasing) | 0 |
-| `SELPHI_DIPLOID_REPLICAS=K` (environment) | Phasing replicas: phase every sample as K copies kept from conditioning on each other and average the dosages over all copies' ensemble members (see [How it works](#how-it-works)). Unset: 3 copies for a run of at most `SELPHI_DIPLOID_REPLICAS_MAX_SAMPLES` samples whose input is unphased (or re-phased under `--force-phasing`), 2 copies of one member each for a larger such run of at most `SELPHI_DIPLOID_REPLICAS_COHORT_MAX` samples, off otherwise; `1` turns it off | auto |
-| `SELPHI_DIPLOID_REPLICAS_MAX_SAMPLES=N` (environment) | Largest run the automatic three-copy replicas apply to | 8 |
-| `SELPHI_DIPLOID_REPLICAS_COHORT_MAX=N` (environment) | Largest run the automatic two-copy replicas apply to | 1000 |
-| `--window-cm F` | Imputation window size in cM | 80 |
-| `--overlap-cm F` | Window overlap in cM | 2 |
-| `SELPHI_WINDOW_MAX_MARKERS=N` (environment) | Most typed sites in one imputation window (its overlap with the next: an eighth of that); 0 = cM windows only. The arrays benchmarked here (10,000-60,000 typed sites per window) never reach it; a WGS-density input does | 100000 |
-| `--sample-batch-size N` | Memory-bounded mode: process target samples in batches of N (0 = off); all formats. Turns the phase ensemble off | 0 |
-
-## How it works
-
-A short overview; the Selphi 2 manuscript (in preparation) has the full method, parameters, and benchmarks.
-
-- **Bitmatrix-native.** The reference panel is stored as 1 bit per allele and shared in memory between phasing and imputation (no VCF round-trip), so memory stays low and the pipeline is fully native (no external bioinformatics tools at runtime).
-- **Phasing.** A diploid genotype graph with a segment HMM and MCMC (two-stage common-then-rare phasing) phases every input, chip and WGS alike. Its common stage runs on the sites with minor-allele frequency ≥ 0.1% in the run's own samples or in the reference panel, so a sample phased on its own keeps its homozygous calls (`SELPHI_DIPLOID_SCAFFOLD_SOURCE=cohort` uses the run's samples only). Its conditioning set is built from PBWT neighbours; on reference panels of 20,000 or more haplotypes it takes 16 neighbours per selection point for up to 50 target samples and 8 for larger cohorts (smaller panels keep the cohort-size rule), because the nearest few neighbours in a large panel are mostly copies of one another. On sequencing-density input (at least 1,000 sites per Mb, the line `--engine auto` uses) a heterozygote whose minor allele no reference haplotype carries, and that at most one target sample carries, is left out of the common stage and placed by the rare stage's vote, which puts the minor allele on the haplotype with the shorter panel match: the segment HMM has no reference template for such an allele (54 1000 Genomes trio children phased together: switch error 2.54% → 2.36% on chromosome 22 over five seeds and 1.88% → 1.69% on chromosome 1 over three, lower for every child; `SELPHI_DIPLOID_PRIVATE_RARE=0` turns it off, `=1` applies it to arrays too). A full phase-and-impute run always has what the rule needs; with `--phase-only` it needs the panel's matrix at the target sites to fit `SELPHI_PHASE_ONLY_RARE_REF_GB` (default 4 GB; a whole WGS chromosome 1 needs 3.2 GB). On chromosome 1 of the trio rig that budget costs 48% more wall time, 51% more CPU and 1.3 GB more peak memory than 2 GB (349 against 236 s, 4,307 against 2,861 CPU-seconds, 12.1 against 10.8 GB), for a switch error of 1.69% instead of 1.88% (lower for all 54 children). The imputation averages over a phase ensemble: by default two members of the one phasing chain (its Viterbi solution and a later MCMC sample, `SELPHI_DIPLOID_INTRA_N`), or, in an unphased run of up to 1,000 samples, the members of several copies of each sample phased in the same run. Two chains run with different seeds still share most of their switch errors (73-75%; even a random starting phase ends on the same ones, because most remaining errors are where the panel does not tell the two phases apart), while copies of a sample phased in the same run share only 57-58%, so a run of at most 8 samples (`SELPHI_DIPLOID_REPLICAS_MAX_SAMPLES`) whose input is unphased phases each sample as three copies in one run, which may not condition on one another (they are identical-by-descent over the whole chromosome), and averages the imputation over all six members; the output keeps one column per sample, its typed-site haplotypes from the first copy. On six consumer arrays imputed one user per run over chromosomes 1-22 (75,552-haplotype panel, 4 threads), this raised SNP R² from 0.9630 to 0.9647 and indel R² from 0.7965 to 0.8002 (per-sample +0.0017 and +0.0038, all six users up on both), for 40% more CPU (2,095-2,168 against 1,504-1,531 CPU-seconds per person) and 4% more mean peak memory. Imputed together as one six-person file, the same arrays gain as much (SNP R² 0.9629 → 0.9645, indel 0.7963 → 0.8000, all six up on both), but there the copies more than double the CPU time (7,647 against 3,339 CPU-seconds on 16 threads; 11.5 against 6.3 min wall, 5.0 against 4.5 GiB peak). A larger unphased run, of 9 to 1,000 samples (`SELPHI_DIPLOID_REPLICAS_COHORT_MAX`), phases each sample as two copies that contribute one member each (their Viterbi solutions), so the ensemble keeps two members but the second comes from an independent copy instead of a sample of the same chain: on 801 1000 Genomes array targets (1000 Genomes panel) OVERALL R² 0.4869 → 0.4899 on chromosome 22 and 0.5755 → 0.5782 on chromosome 1, every MAF bin up on both, for 25% more CPU and 24-25% more wall time on chromosome 1 at about the same peak memory (11.0 against 11.2 GiB); above 1,000 samples nothing changes. A copy on its own phases worse than the single chain, so `--phase-only` writes the single chain's phase. `SELPHI_DIPLOID_REPLICAS=K` sets the number of copies for any run, `=1` turns them off.
-- **Imputation.** Per target haplotype and window, a coded-step PBWT selects reference candidates and a Li-Stephens HMM (f32 state vectors, f64 recombination probabilities and row sums, streamed backward) produces per-site weights, interpolated to full panel density via cache-friendly tiles fused to output encoding. Untyped sites are placed between their flanking typed anchors in cumulative genetic distance (cM), as Beagle, IMPUTE5 and minimac do (`SELPHI_INTERP_RANK=1` restores variant-rank placement). The effective population size is calibrated to panel size. The emission error floor adapts to the array: in each target haplotype's first window the HMM measures how much posterior weight it has to put on panel haplotypes outside the site's PBWT match set, which a genotyping array's miscalls raise, and above a threshold it runs again with a higher floor (up to 0.07, from the default 0.025) that the haplotype keeps for the chromosome; error-free inputs keep the default. Only fully trusted calls count in that measure (not no-calls or calls entered with reduced confidence); `--p-err` sets a fixed floor instead, as does `SELPHI_PERR_FIXED=1`. On six consumer arrays this raised per-sample R² on 18 of 18 person-chromosomes (median +0.0005). On panels of 100,000 or more haplotypes the PBWT scan keeps the 200 longest matches per side at each site (`SELPHI_PBWT_WALK_CAP`; `0` turns it off); below that size the scan is unchanged. On panels of 20,000 to 99,999 haplotypes the copying HMM gets a wider state: 400 PBWT forward neighbours per site (`--fl-fwd`; 160 by the 2600/log2 rule on a 75,552-haplotype panel) and the 100 best matches per site instead of 50. On that 75,552-haplotype panel six consumer arrays (22 autosomes, per-person R² against their genomes) rose for every person, SNPs and indels, with internal phasing (+0.0003 / +0.0004) and with Beagle's phasing (+0.0003 / +0.0006), and the GIAB array templates rose on chromosomes 21 and 1 (R² 0.9700 to 0.9708 and 0.9771 to 0.9777), for 3-4% more CPU and the same peak memory on six samples. Smaller panels keep the old values: on 1000 Genomes the same change made the chain stickier (rare bins up, common bins down) on held-out chromosomes.
-- **Low-coverage WGS.** The `--lcwgs` engine works directly on genotype likelihoods (GL-weighted Li-Stephens forward-backward with sparse-PBWT selection, and an eight-founder phasing HMM that re-commits phase at every Gibbs iteration), processing the chromosome in cM chunks so the panel is never fully resident. One sample's chunks run their Gibbs chains in thread pools of their own; where the process's thread limit (`RLIMIT_NPROC`, a cgroup's `pids.max`) leaves too little room, the run does without them and does the work of any thread the system refuses on the thread that asked for it (the BGZF readers and writers then work on one thread), with the same output.
-- **SRP panel format.** A single binary file holds one or many chromosomes as 2D zstd-compressed sparse tiles (1024 variants × 4096 haplotypes) for L2-cache-friendly streaming. Creation from BCF or BREF3 is fully streaming (under 500 MB for any panel size) and the BCF reader uses parallel CSI-indexed regional reads; a VCF.gz source is loaded into memory first.
-- **Determinism.** Fixed-seed parallelism yields bit-identical results across runs. Phasing and chip/WGS imputation give the same bits on the AVX-512, AVX2 and scalar paths (`SELPHI_FORCE_AVX2=1`, `SELPHI_FORCE_SCALAR=1`), and the phasing kernels' NEON path reproduces them exactly; the phasing transition probabilities use a built-in `expm1f` rather than the C library's, whose x86_64 and aarch64 builds differ in the last bit. The lcWGS forward-backward agrees across paths up to f32 reduction order.
+Methods, parameters and the full benchmarks (accuracy by allele frequency, phasing switch error, other panels and
+tools) are in the Selphi 2 manuscript, in preparation.
 
 ## Citation
-
-If you use Selphi in your research, please cite:
 
 ```
 Selphi, a tool for improving genotype imputation accuracy
@@ -614,10 +274,9 @@ Charlie Manson, Salvatore Loguercio, Andrew Terpolovsky, Mykyta Matushyn, Ali To
 Scientific Reports 16, 28051 (2026); doi: https://doi.org/10.1038/s41598-026-58420-2
 ```
 
-Full article: [Scientific Reports](https://www.nature.com/articles/s41598-026-58420-2).
+## License
 
-# Non-Commercial Use License
-
-## NOTICE
-
-This software is provided free of charge for **academic research use only**. Any use by **commercial entities, for-profit organizations, or consultants** is strictly prohibited without prior authorization. For inquiries about commercial licensing, contact **pyazdi@gmail.com**.
+This software is provided free of charge for **academic research use only**. Any use by **commercial entities,
+for-profit organizations, or consultants** is strictly prohibited without prior authorization. For inquiries about
+commercial licensing, contact **pyazdi@gmail.com**. Full terms in [LICENSE](LICENSE); code adapted from
+other projects keeps its own licence terms, listed in [NOTICE](NOTICE).
