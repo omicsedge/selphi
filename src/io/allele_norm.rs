@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn the_contig_start_keeps_a_right_anchor() {
-        // The Codex probe: in an N run from base 1, NN>N at 2002 is NN>N at 1.
+        // In an N run from base 1, NN>N at 2002 is NN>N at 1.
         let seq = vec![b'N'; 3000];
         assert_eq!(norm_on(&seq, 0, 2002, "NN", "N", 10_000), (1, "NN".into(), "N".into(), NormStatus::Normalized));
         // Deleting the first base of AAAC: AA>A at 1, unchanged; from 2 it moves to 1.

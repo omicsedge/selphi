@@ -227,8 +227,8 @@ fn random_plan(rng: &mut reference_pack::Xs, n: usize) -> Plan {
 /// The dispatcher (`run_forward_backward_with`) gives the canonical dosages and
 /// posterior masses bit for bit on the AVX-512 (x86) and NEON (aarch64) paths:
 /// one pass and two (taken from 4096 sites and 16 states: the unlinked calls
-/// must reach `two_pass::run`), without and with read-pair anchors, Codex's witness
-/// among them.
+/// must reach `two_pass::run`), without and with read-pair anchors, the anchored
+/// one-site case among them.
 #[test]
 fn dispatcher_matches_canonical_bits() {
     use reference_pack as rp;
@@ -252,7 +252,7 @@ fn dispatcher_matches_canonical_bits() {
         want
     };
 
-    // Codex's witness: one site, 16 states, an identity anchor at site 0 (the
+    // The anchored one-site case: one site, 16 states, an identity anchor at site 0 (the
     // former 4-lane NEON anchored kernels gave 0x3f2ccccc).
     let row: Vec<u8> = (0..16).map(|h| (0x0822u32 >> h & 1) as u8).collect();
     let bm = HaplotypeBitmatrix::from_byte_slice_all(1, 16, &row, 16);

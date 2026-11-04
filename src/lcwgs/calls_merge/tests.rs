@@ -185,20 +185,20 @@ fn a_low_gq_call_with_a_certain_call_of_its_kind_at_its_position_is_kept() {
 #[test]
 fn replacement_is_atomic_per_group() {
     let f = fx(R, &[
-        (5, "A", "C", 0, 5),                       // Codex's example: A>C,G filtered 1/2, only A>C a panel row
+        (5, "A", "C", 0, 5),                       // A>C,G filtered 1/2, only A>C a panel row
         (6, "C", "A", 1, 5), (6, "C", "T", 0, 5),  // a no-call with both alleles in the panel: replaced, both rows
         (7, "A", "G", 1, 5),                       // two no-calls of one allele: one group, one row
         (8, "G", "A", 1, 5),                       // a no-call sharing its allele with a partial record: kept
     ]);
-    let codex = "chr22\t5\t.\tA\tC,G\t.\tLowQual\t.\tGT:GQ\t1/2:7".to_string();
+    let filtered = "chr22\t5\t.\tA\tC,G\t.\tLowQual\t.\tGT:GQ\t1/2:7".to_string();
     let multi = "chr22\t6\t.\tC\tA,T\t.\tRefCall\t.\tGT:GQ\t./.:2".to_string();
     let n1 = rec(7, "A", "G", "RefCall", "./.", 3);
     let n2 = rec(7, "A", "G", "RefCall", "./.", 4);
     let p1 = rec(8, "G", "A", "RefCall", "./.", 2);
     let p2 = "chr22\t8\t.\tG\tA,T\t.\tRefCall\t.\tGT:GQ\t./.:2".to_string();
-    let (out, c) = f.run(pol(), &[codex.clone(), multi, n1, n2, p1.clone(), p2.clone()]);
+    let (out, c) = f.run(pol(), &[filtered.clone(), multi, n1, n2, p1.clone(), p2.clone()]);
     assert_eq!(out, vec![
-        ann(&codex, "partial", "0,.", "5,."),
+        ann(&filtered, "partial", "0,.", "5,."),
         sel(6, "C", "A", 1, 5, "nocall", ".", "2", "6", "0"),
         sel(6, "C", "T", 0, 5, "nocall", ".", "2", "6", "0"),
         sel(7, "A", "G", 1, 5, "nocall", ".", "3", "7,7", "0,1"),
