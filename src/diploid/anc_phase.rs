@@ -675,10 +675,14 @@ pub fn correct_scaffold(check: &Checker, phased: &mut [u8], pq: &mut [u8], n_sit
     let mut n_done = 0;
     for (s, d) in decisions.iter().enumerate() {
         let span: usize = d.flips.iter().map(|&(a, b)| b - a).sum();
-        crate::selphi_info!("    Ancestry phase check, sample {}: pair {}/{} over {:.0}% of windows, LR {:.3}/window, {} group changes -> {}{}",
-            s, GROUPS[d.pair.0 as usize], GROUPS[d.pair.1 as usize], 100.0 * d.pair_frac, d.lr_per_window, d.anc_changes,
-            if d.applied { format!("{} inverted segment(s), {} sites", d.flips.len(), span) } else { "unchanged".to_string() },
-            if d.applied && !apply { " (report only)" } else { "" });
+        // One line per sample for small runs (or --debug); a cohort lists only the samples it changes, the
+        // caller prints the count.
+        if (d.applied && !d.flips.is_empty()) || n_samples <= 8 || crate::log::is_debug() {
+            crate::selphi_info!("    Ancestry phase check, sample {}: pair {}/{} over {:.0}% of windows, LR {:.3}/window, {} group changes -> {}{}",
+                s, GROUPS[d.pair.0 as usize], GROUPS[d.pair.1 as usize], 100.0 * d.pair_frac, d.lr_per_window, d.anc_changes,
+                if d.applied { format!("{} inverted segment(s), {} sites", d.flips.len(), span) } else { "unchanged".to_string() },
+                if d.applied && !apply { " (report only)" } else { "" });
+        }
         if !d.applied || d.flips.is_empty() { continue; }
         n_done += 1;
         if !apply { continue; }
