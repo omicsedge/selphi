@@ -995,9 +995,9 @@ pub fn run_multi_chr(
         // pipeline so the two impute paths cannot drift in match_length / fl_fwd
         // / fl_bwd / est_ne. Honors the same `--match-length`/`--fl-fwd`/
         // `--fl-bwd`/`--est-ne` overrides.
-        let crate::imputation_pipeline::PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches } =
+        let crate::imputation_pipeline::PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches, allele_ls } =
             crate::imputation_pipeline::auto_calibrate_pbwt_params(
-                config.match_length, config.fl_fwd, config.fl_bwd, config.est_ne, n_ref, n_chip,
+                config.match_length, config.fl_fwd, config.fl_bwd, config.est_ne, n_ref, n_chip, config.p_err_fixed,
             );
         selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}, kept matches: {}",
             match_length, fl_fwd, fl_bwd, est_ne, kept_matches);
@@ -1133,7 +1133,7 @@ pub fn run_multi_chr(
             let hmm_params = selphi::imputation::window_process::WindowHmmParams {
                 n_ref, n_haps, match_length, fl_fwd, fl_bwd,
                 est_ne: est_ne as f64, p_err: config.p_err, adapt_floor: !config.p_err_fixed,
-                max_candidates: effective_mc, kept_matches,
+                max_candidates: effective_mc, kept_matches, allele_ls,
                 compute_posterior: wi + 1 < windows.len(),
                 target_batch_size: config.target_batch_size,
             };

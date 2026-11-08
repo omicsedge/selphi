@@ -37,6 +37,8 @@ pub(crate) struct PbwtParams {
     pub(crate) est_ne: i64,
     /// Haplotypes kept per site from the scored PBWT matches (`match_processing::process_matches`).
     pub(crate) kept_matches: usize,
+    /// Allele-aware copying model (`hmm::ALLELE_LS_*`).
+    pub(crate) allele_ls: bool,
 }
 
 /// From this many haplotypes up to biobank scale (`pbwt::AUTO_CAP_MIN_HAPS`), the copying HMM gets a wider
@@ -61,6 +63,7 @@ pub(crate) fn auto_calibrate_pbwt_params(
     est_ne_override: i64,
     n_ref: usize,
     n_chip: usize,
+    p_err_given: bool,
 ) -> PbwtParams {
     // Minimum match length for the imputation PBWT: the neighbour scan walks
     // outward from the target until the running divergence says the match has
@@ -121,7 +124,20 @@ pub(crate) fn auto_calibrate_pbwt_params(
     let fl_bwd = fl_bwd_override.unwrap_or_else(|| {
         ((fl_fwd as f64 * 2.4 / log2_haps) as usize).max(13)
     });
-    let est_ne = if est_ne_override <= 0 {
+    // Allele-aware copying model below LARGE_PANEL_HAPS (measured on 1,500- and 4,800-haplotype
+    // panels; the larger ones keep the match-set model). SELPHI_ALLELE_LS=0 = off (old output),
+    // =1 = on at any panel size. An explicit --p-err (or SELPHI_PERR_OVERRIDE) sets the match-set model's
+    // emission, so it keeps that model.
+    let p_err_given = p_err_given || selphi::config::raw("SELPHI_PERR_OVERRIDE").is_some();
+    let allele_ls = !p_err_given && match selphi::config::raw("SELPHI_ALLELE_LS").as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => n_ref < LARGE_PANEL_HAPS,
+    };
+    let est_ne = if est_ne_override <= 0 && allele_ls {
+        // Its optimum scales with the panel: 250-300k at 1,502 haplotypes, 0.7-1M at 4,802.
+        (selphi::imputation::hmm::ALLELE_LS_NE_PER_HAP * n_ref as f64).round() as i64
+    } else if est_ne_override <= 0 {
         // Adaptive Ne: scales linearly with panel size — constant ratio
         // Ne / n_ref ≈ 36 across panels validated above. The linear rule is
         // calibrated on panels >= ~4,800 haplotypes; below that it under-sets Ne,
@@ -142,7 +158,7 @@ pub(crate) fn auto_calibrate_pbwt_params(
     } else {
         est_ne_override
     };
-    PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches }
+    PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches, allele_ls }
 }
 
 /// Per-format batched-writer activity flags. Mirrors the `formats` struct
@@ -1426,10 +1442,10 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     selphi_step!("Genetic map loaded + LD correction");
 
     // 7. Auto-calibrate parameters
-    let PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches } =
-        auto_calibrate_pbwt_params(args.match_length, args.fl_fwd, args.fl_bwd, args.est_ne, n_ref, n_chip);
-    selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}, kept matches: {}",
-        match_length, fl_fwd, fl_bwd, est_ne, kept_matches);
+    let PbwtParams { match_length, fl_fwd, fl_bwd, est_ne, kept_matches, allele_ls } =
+        auto_calibrate_pbwt_params(args.match_length, args.fl_fwd, args.fl_bwd, args.est_ne, n_ref, n_chip, args.p_err.is_some());
+    selphi_debug!("  Match length: {}, fl_fwd: {}, fl_bwd: {}, Ne: {}, kept matches: {}, allele-aware: {}",
+        match_length, fl_fwd, fl_bwd, est_ne, kept_matches, allele_ls);
 
     // 8. Compute imputation windows
     let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm,
@@ -1705,7 +1721,7 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         let t0_hmm = Instant::now();
         let hmm_params = selphi::imputation::window_process::WindowHmmParams {
             n_ref, n_haps, match_length, fl_fwd, fl_bwd,
-            est_ne: est_ne as f64, p_err, adapt_floor: args.p_err.is_none(), max_candidates, kept_matches,
+            est_ne: est_ne as f64, p_err, adapt_floor: args.p_err.is_none(), max_candidates, kept_matches, allele_ls,
             compute_posterior: wi + 1 < windows.len(),
             target_batch_size: target_batch_size_haps,
         };

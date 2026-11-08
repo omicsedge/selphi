@@ -33,6 +33,8 @@ pub struct WindowHmmParams {
     pub max_candidates: usize,
     /// Haplotypes kept per site from the scored PBWT matches (`match_processing::process_matches`).
     pub kept_matches: usize,
+    /// Allele-aware copying model (`hmm::ALLELE_LS_*`): fixed p_err 0.5, no adaptive floor.
+    pub allele_ls: bool,
     /// Whether the HMM should compute `hap_posterior` for cross-window passthrough.
     /// Set to false on the final window — the posterior is an `n_ref`-sized f64
     /// vector per target that would never be read, saving ~13 GB at biobank scale.
@@ -1159,7 +1161,7 @@ pub fn process_window_hmm(
     let fl_fwd = params.fl_fwd;
     let fl_bwd = params.fl_bwd;
     let est_ne = params.est_ne;
-    let p_err = params.p_err;
+    let p_err = if params.allele_ls { super::hmm::ALLELE_LS_P_ERR } else { params.p_err };
     let max_candidates = params.max_candidates;
     let breaks_w = vec![(0usize, n_var_w)];
 
@@ -1214,7 +1216,7 @@ pub fn process_window_hmm(
         Some(c) => c,
         None => { own_classes = super::hap_dedup::allele_classes(ref_bm, chip_start, n_var_w, n_ref); &own_classes }
     };
-    let adapt = if params.adapt_floor { perr_adapt() } else { None };
+    let adapt = if params.adapt_floor && !params.allele_ls { perr_adapt() } else { None };
     // (haplotypes measured, raised, sum of their unmatched mass, sum of their floors)
     let mut adapt_stats = (0usize, 0usize, 0.0f64, 0.0f64);
     // Each target's carry, locked only by the task that runs its HMM: its prior and floor are
@@ -1278,7 +1280,7 @@ pub fn process_window_hmm(
                 None => (super::hmm::prepare_weights(
                     csc, cm_w, n_ref, est_ne, params.kept_matches,
                     Some(super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(classes) }),
-                    n_var_w, ne_w, prior,
+                    n_var_w, ne_w, prior, params.allele_ls,
                 ), breaks_w.clone()),
                 Some(sites) => {
                     let cm_s: Vec<f64> = sites.iter().map(|&v| cm_w[v]).collect();
@@ -1286,17 +1288,24 @@ pub fn process_window_hmm(
                     let n = sites.len();
                     let src = (!nocall_dedup_off()).then_some(
                         super::hmm::RefAlleleSource::Bitmatrix { bm: ref_bm, chip_start, classes: Some(classes) });
-                    (super::hmm::prepare_weights(csc, &cm_s, n_ref, est_ne, params.kept_matches, src, n, ne_s.as_deref(), prior),
+                    (super::hmm::prepare_weights(csc, &cm_s, n_ref, est_ne, params.kept_matches, src, n, ne_s.as_deref(), prior,
+                        params.allele_ls),
                      vec![(0usize, n)])
                 }
             };
             // Rows nothing reads are left empty: inside the HMM for a target over every window row
             // (`run_weights` ignores the mask while it measures the floor), after the expansion
             // for one over its called sites.
+            // The allele-aware model reads this haplotype's alleles at the HMM's sites.
+            let tgt_alleles: Option<Vec<u8>> = params.allele_ls.then(|| match called {
+                None => (0..n_var_w).map(|v| targ_w[v * n_haps + tgt]).collect(),
+                Some(sites) => sites.iter().map(|&v| targ_w[v * n_haps + tgt]).collect(),
+            });
             let run = |floor: f64, measure: bool| {
                 let mut r = super::hmm::run_weights(
                     &prep, &breaks, floor, None, conf_hap.as_deref(), params.compute_posterior, measure,
-                    if called.is_none() { keep_rows } else { None });
+                    if called.is_none() { keep_rows } else { None },
+                    tgt_alleles.as_deref().map(|t| super::hmm::AlleleEm { bm: ref_bm, chip_start, target: t, rows: called }));
                 if let Some(sites) = called {
                     let x = interp_x_w.unwrap_or(cm_w);
                     r.weights = r.weights.into_iter()

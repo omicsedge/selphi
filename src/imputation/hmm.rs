@@ -497,6 +497,64 @@ struct LsHmmModel<'a> {
     // R1 hybrid emission: per-chip-site mismatch prob ε_eff. None → use the scalar
     // `p_err` (byte-identical to the shipped path). Some(sp) → sp[chip_idx] per site.
     site_perr: Option<&'a [f64]>,
+    // Allele-aware model (`AlleleEm`): the states carrying the other allele at a site, x `ALLELE_LS_MISMATCH`.
+    mismatch: Option<&'a MismatchMask>,
+}
+
+/// Allele-aware copying model, the default on panels below 20,000 haplotypes (`imputation_pipeline`):
+/// a state carrying the target's other allele at a chip site emits `ALLELE_LS_MISMATCH` times what a
+/// matching one does, every state emits alike otherwise (p_err = 0.5: no match-set bonus), and the
+/// recombination shift is divided by the whole state mass (`SELPHI_HMM_TOTAL_RECOMB_DENOM`), with
+/// Ne = `ALLELE_LS_NE_PER_HAP` x n_ref. Either half alone loses accuracy; together they gain in every
+/// MAF bin on 1,500- and 4,800-haplotype panels (DESIGN_LOG 2026-11-08).
+pub const ALLELE_LS_P_ERR: f64 = 0.5;
+pub const ALLELE_LS_MISMATCH: f32 = 0.01;
+pub const ALLELE_LS_NE_PER_HAP: f64 = 200.0;
+
+/// One target haplotype's alleles at the HMM's sites, and where the panel's are.
+pub struct AlleleEm<'a> {
+    pub bm: &'a crate::common::HaplotypeBitmatrix,
+    pub chip_start: usize,
+    /// The target's allele at each HMM site.
+    pub target: &'a [u8],
+    /// Window row of each HMM site when the HMM runs over a subset of the window (called sites).
+    pub rows: Option<&'a [usize]>,
+}
+
+/// Per HMM site, the states whose (representative) haplotype carries the other allele, and the
+/// factor they emit at: `ALLELE_LS_MISMATCH`, or towards 1 at a site of input confidence c < 1
+/// (`--refine`), so a zero-confidence call is neutral.
+struct MismatchMask { words: usize, bits: Vec<u64>, factors: Option<Vec<f32>> }
+
+impl MismatchMask {
+    fn build(ae: &AlleleEm, state_to_hap: &[i64], n_sites: usize, conf: Option<&[f64]>) -> Self {
+        let words = state_to_hap.len().div_ceil(64).max(1);
+        let mut bits = vec![0u64; n_sites * words];
+        for (v, out) in bits.chunks_exact_mut(words).enumerate() {
+            let row = ae.bm.row(ae.chip_start + ae.rows.map_or(v, |r| r[v]));
+            let t = (ae.target[v] & 1) as u64;
+            for (j, &h) in state_to_hap.iter().enumerate() {
+                let h = h as usize;
+                if (row[h >> 6] >> (h & 63)) & 1 != t { out[j >> 6] |= 1u64 << (j & 63); }
+            }
+        }
+        let factors = conf.filter(|c| c.iter().any(|&x| x < 1.0)).map(|c| {
+            c.iter().map(|&x| ALLELE_LS_MISMATCH + (1.0 - x.clamp(0.0, 1.0) as f32) * (1.0 - ALLELE_LS_MISMATCH)).collect()
+        });
+        Self { words, bits, factors }
+    }
+
+    #[inline]
+    fn apply(&self, site: usize, row: &mut [f32]) {
+        let f = self.factors.as_ref().map_or(ALLELE_LS_MISMATCH, |fs| fs[site]);
+        for (wi, &word) in self.bits[site * self.words..(site + 1) * self.words].iter().enumerate() {
+            let mut m = word;
+            while m != 0 {
+                row[wi * 64 + m.trailing_zeros() as usize] *= f;
+                m &= m - 1;
+            }
+        }
+    }
 }
 
 /// How far a vectorised row sum ([`sum_any_order`]) is known to agree with the serial one.
@@ -635,6 +693,7 @@ fn forward_step(
         group_sizes,
         emission_ratios,
         site_perr,
+        mismatch,
         ..
     } = model;
     let p_no_err = 1.0 - p_err;
@@ -679,6 +738,7 @@ fn forward_step(
             cur[j] *= ratio;
         }
     }
+    if let Some(mm) = mismatch { mm.apply(chip_idx, cur); }
 }
 
 /// The forward pass, stored at √n checkpoints instead of in full.
@@ -1125,6 +1185,7 @@ fn streaming_backward_combine(
         group_mass,
         emission_ratios,
         site_perr,
+        mismatch,
     } = model;
     let mass_sizes = group_mass.map(|gm| gm.sizes);
     let inverse_sizes = group_mass.map(|gm| gm.inverse_sizes);
@@ -1240,6 +1301,7 @@ fn streaming_backward_combine(
                         p_no_err_f * val
                     };
                 }
+                if let Some(mm) = mismatch { mm.apply(chip_idx, &mut cur_bwd); }
 
                 if prune_threshold > 0.0 || diag {
                     // Row sum (f64 for stability)
@@ -1502,8 +1564,8 @@ pub fn calculate_weights(
     measure_unmatched: bool,
 ) -> HmmResult {
     let prep = prepare_weights(match_matrix, distances_cm, n_ref_haps, est_ne, match_processing::KEPT_MATCHES, ref_alleles, n_chip,
-                               ne_per_site, hap_prior);
-    run_weights(&prep, output_breaks, min_perr, site_emission_ratios, c, compute_posterior, measure_unmatched, None)
+                               ne_per_site, hap_prior, false);
+    run_weights(&prep, output_breaks, min_perr, site_emission_ratios, c, compute_posterior, measure_unmatched, None, None)
 }
 
 /// The floor-independent part of `calculate_weights` (see `HmmPrep`).
@@ -1518,6 +1580,7 @@ pub fn prepare_weights<'a>(
     n_chip: usize,
     ne_per_site: Option<&[f64]>,
     hap_prior: Option<&'a [(i64, f64)]>,
+    allele_ls: bool,
 ) -> HmmPrep<'a> {
     // 1. Process matches: CSC → scored top-K → freq filter → range expansion
     let expanded = match_processing::process_matches(match_matrix, kept_matches);
@@ -1610,7 +1673,7 @@ pub fn prepare_weights<'a>(
         Some(ref gs) => gs.iter().sum(),
         None => n_states as f64,
     };
-    let use_total = crate::config::is_one("SELPHI_HMM_TOTAL_RECOMB_DENOM");
+    let use_total = allele_ls || crate::config::is_one("SELPHI_HMM_TOTAL_RECOMB_DENOM");
     let mut n_haps_per_site = vec![1.0f64; distances_cm.len()];
     for (site, dm) in dense_matches.iter().enumerate() {
         let nh = if use_total {
@@ -1661,6 +1724,8 @@ pub fn run_weights(
     // Window rows whose weights are read (`io::pipeline::needed_weight_rows`); the rest come out
     // empty. Ignored while the adaptive floor measures (it reads every row).
     keep: Option<&[bool]>,
+    // The allele-aware model's per-site mismatch emission (None: the match-set emission alone).
+    allele_em: Option<AlleleEm<'_>>,
 ) -> HmmResult {
     let keep = keep.filter(|_| !(measure_unmatched || perr_em_diag()));
     let HmmPrep {
@@ -1720,6 +1785,11 @@ pub fn run_weights(
         None
     };
 
+    // The allele-aware mismatch emission, softened by the same confidence as `site_perr`.
+    let const_conf: Option<Vec<f64>> = c.is_none().then_some(()).and(const_c_env.filter(|&x| x < 1.0))
+        .map(|x| vec![x; n_sites]);
+    let mismatch = allele_em.map(|ae| MismatchMask::build(&ae, state_to_hap, n_sites, c.or(const_conf.as_deref())));
+
     // Debug: dump HMM internals for hap0
     if log_n == 0 {
         selphi_debug!("  [FWD-DBG] n_states={} p_err={:.8} prune={:.6}", n_states, p_err, prune_threshold);
@@ -1774,7 +1844,7 @@ pub fn run_weights(
             group_sizes: group_sizes_f32.as_deref(),
             group_mass,
             emission_ratios: dense_emission_ratios.as_deref(),
-            site_perr: site_perr.as_deref(),
+            site_perr: site_perr.as_deref(), mismatch: mismatch.as_ref(),
         };
         let (fwd, new_alpha, new_sum) = compute_forward(
             &fwd_model,
@@ -1798,7 +1868,7 @@ pub fn run_weights(
             let dump_model = LsHmmModel {
                 dense_matches: &dense_matches, n_matches: &n_matches, n_haps: &n_haps_per_site,
                 precomb: &f_precomb, n_states, p_err, group_sizes: group_sizes_f32.as_deref(), group_mass,
-                emission_ratios: dense_emission_ratios.as_deref(), site_perr: site_perr.as_deref(),
+                emission_ratios: dense_emission_ratios.as_deref(), site_perr: site_perr.as_deref(), mismatch: mismatch.as_ref(),
             };
             for (bi, &(bstart, bstop)) in output_breaks.iter().enumerate() {
                 let cp = &fwd_blocks[bi];
@@ -1847,7 +1917,7 @@ pub fn run_weights(
             group_sizes: group_sizes_f32.as_deref(),
             group_mass,
             emission_ratios: dense_emission_ratios.as_deref(),
-            site_perr: site_perr.as_deref(),
+            site_perr: site_perr.as_deref(), mismatch: mismatch.as_ref(),
         };
         let bwd_model = LsHmmModel {
             dense_matches: &dense_matches,
@@ -1859,7 +1929,7 @@ pub fn run_weights(
             group_sizes: group_sizes_f32.as_deref(),
             group_mass,
             emission_ratios: dense_emission_ratios.as_deref(),
-            site_perr: site_perr.as_deref(),
+            site_perr: site_perr.as_deref(), mismatch: mismatch.as_ref(),
         };
         let csr = streaming_backward_combine(
             cp, &fwd_model, &bwd_model,
@@ -2222,6 +2292,7 @@ mod tests {
             group_mass: grouped.then_some(GroupMass { sizes: &group_sizes_f32, inverse_sizes: &inverse_sizes }),
             emission_ratios: (emission_mode == 1).then_some(emission_ratios.as_slice()),
             site_perr: (emission_mode == 2).then_some(site_perr.as_slice()),
+            mismatch: None,
         };
         let state_to_hap: Vec<i64> = if grouped {
             offsets[..sizes.len()].iter().map(|&h| h as i64).collect()
@@ -2394,6 +2465,38 @@ mod tests {
         assert_eq!(*start, 0);
         assert_eq!(csr.n_rows, n_var);
         assert!(csr.nnz() > 0, "expected non-zero weights, got nnz=0");
+    }
+}
+
+#[cfg(test)]
+mod allele_ls_tests {
+    use super::*;
+
+    /// The mask flags exactly the states whose representative carries the other allele (called-site
+    /// rows included), multiplies them by ALLELE_LS_MISMATCH, and a zero-confidence site is neutral.
+    #[test]
+    fn mismatch_mask_flags_the_other_allele() {
+        // 3 panel sites x 70 haps (two words): hap h carries ALT at site s when (h + s) % 3 == 0.
+        let bm = crate::common::HaplotypeBitmatrix::from_panel(3, 70, &|s, h| (h + s) % 3 == 0, &[true; 3]);
+        let state_to_hap: Vec<i64> = vec![0, 1, 2, 65, 66, 69];
+        let target = [1u8, 0];
+        let rows = [0usize, 2];
+        let ae = AlleleEm { bm: &bm, chip_start: 0, target: &target, rows: Some(&rows) };
+        let mm = MismatchMask::build(&ae, &state_to_hap, 2, Some(&[1.0, 0.0]));
+        let mut r0 = vec![1.0f32; 6];
+        mm.apply(0, &mut r0);
+        let want0: Vec<f32> = state_to_hap.iter()
+            .map(|&h| if h % 3 == 0 { 1.0 } else { ALLELE_LS_MISMATCH }).collect();
+        assert_eq!(r0, want0);
+        let mut r1 = vec![1.0f32; 6];
+        mm.apply(1, &mut r1);
+        assert_eq!(r1, vec![1.0f32; 6]);
+        let mm = MismatchMask::build(&ae, &state_to_hap, 2, None);
+        let mut r1 = vec![1.0f32; 6];
+        mm.apply(1, &mut r1);
+        let want1: Vec<f32> = state_to_hap.iter()
+            .map(|&h| if (h + 2) % 3 == 0 { ALLELE_LS_MISMATCH } else { 1.0 }).collect();
+        assert_eq!(r1, want1);
     }
 }
 
