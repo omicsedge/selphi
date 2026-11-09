@@ -230,6 +230,14 @@ impl CsrWeights {
                      n_cols: self.n_cols, packed }
     }
 
+    /// The plain form of a packed CSR (unchanged when unpacked).
+    pub fn unpack(self) -> CsrWeights {
+        if !self.is_packed() { return self; }
+        let indices = self.packed.iter().map(|&x| (x >> 16) as i32).collect();
+        let data = self.packed.iter().map(|&x| unpack_weight(x as u16)).collect();
+        CsrWeights { indptr: self.indptr, indices, data, n_rows: self.n_rows, n_cols: self.n_cols, packed: Vec::new() }
+    }
+
     /// Row `r`'s entries as (column, value), in stored order, into `out`.
     pub fn row_entries(&self, r: usize, out: &mut Vec<(i32, f32)>) {
         let (s, e) = (self.indptr[r] as usize, self.indptr[r + 1] as usize);

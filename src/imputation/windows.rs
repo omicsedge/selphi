@@ -52,7 +52,8 @@ pub const DEFAULT_WINDOW_WEIGHT_BUDGET_MB: usize = 5 * 1024;
 
 /// [`compute_imputation_windows`], with windows that would hold more than the weight budget
 /// ([`DEFAULT_WINDOW_WEIGHT_BUDGET_MB`]) at `marker_bytes` per typed marker cut into as few equal
-/// windows as fit it. `marker_bytes` 0: no budget.
+/// windows as fit it. `marker_bytes` 0: no budget. The bound is approximate: a window holds at
+/// least 128 markers, and a few markers isolated by a gap still join their neighbour.
 pub fn compute_imputation_windows_within(
     chip_cm: &[f64], window_cm: f64, overlap_cm: f64, max_markers: usize, marker_bytes: usize,
 ) -> Vec<ImputationWindow> {

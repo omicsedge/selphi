@@ -482,8 +482,25 @@ pub fn impute_with_members(
     let classes = super::window_process::WindowClasses::default();
     let inputs0 = ImputeWindowInputs { allele_classes: Some(&classes), ..*inputs };
     let mut out = impute_window(&inputs0, params, precomputed_candidates, carry, WeightsOut::Collect);
+    // Member 0's packed weights take each member's sum repacked (a rounding of at most 2^-11 per
+    // fold): beyond a few folds the running sum is kept exact and packed once it is the mean.
+    let folds: usize = members.iter().map(|m| m.n_blocks).sum();
+    let exact = folds > PACKED_FOLDS_MAX && out.all_weights.iter().flatten().any(|(_, w)| w.is_packed());
+    if exact { repack(&mut out.all_weights, CsrWeights::unpack); }
     fold_window_shared(&mut out.all_weights, members, ctx, params, Some(&classes));
+    if exact { repack(&mut out.all_weights, CsrWeights::pack); }
     out
+}
+
+/// Extra members folded into member 0's packed sums directly; more keep the sums exact until the mean.
+const PACKED_FOLDS_MAX: usize = 3;
+
+fn repack(all_weights: &mut [Vec<(usize, CsrWeights)>], f: fn(CsrWeights) -> CsrWeights) {
+    use rayon::prelude::*;
+    all_weights.par_iter_mut().for_each(|hw| {
+        for (_, w) in hw.iter_mut() { *w = f(std::mem::replace(w, CsrWeights {
+            indptr: Vec::new(), indices: Vec::new(), data: Vec::new(), n_rows: 0, n_cols: 0, packed: Vec::new() })); }
+    });
 }
 
 /// An extra member's window inputs: its own scaffold and Ne, everything else member 0's
