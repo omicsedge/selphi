@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::srp::SrpReader;
-use crate::imputation::hmm::{CsrWeights, PackedEntries, PlainEntries, WeightEntries};
+use crate::imputation::hmm::{CsrWeights, PackedEntries, PlainEntries, WeightEntries, WidePackedEntries};
 
 // ---------------------------------------------------------------------------
 // Shared types for multi-format output
@@ -2319,7 +2319,9 @@ fn interp_kernel(
                 // Fused scatter: accumulate ws*(1-t[v]) + we*t[v] = ws + t[v]*(we-ws)
                 // for each reference column with allele=1 at variant v.
                 // Merge start and end weight ranges by column index.
-                if w.is_packed() {
+                if w.is_packed() && w.is_wide() {
+                    scatter_fused(&WidePackedEntries(&w.packed), s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
+                } else if w.is_packed() {
                     scatter_fused(&PackedEntries(&w.packed), s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
                 } else {
                     scatter_fused(&PlainEntries(&w.indices, &w.data), s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
@@ -2512,7 +2514,10 @@ fn interpolate_tile_rows(
 
             for sov in &sovs {
                 let (tt, out) = (&t[sov.out_off..sov.out_off + sov.ov_n], &mut hap_out[sov.out_off..sov.out_off + sov.ov_n]);
-                if w.is_packed() {
+                if w.is_packed() && w.is_wide() {
+                    scatter_fused_tiled(&WidePackedEntries(&w.packed), s1, e1, s2, e2, sov.tiles, n_tile_cols,
+                                        sov.lr_start, sov.lr_end, tt, out);
+                } else if w.is_packed() {
                     scatter_fused_tiled(&PackedEntries(&w.packed), s1, e1, s2, e2, sov.tiles, n_tile_cols,
                                         sov.lr_start, sov.lr_end, tt, out);
                 } else {

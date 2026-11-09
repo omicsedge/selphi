@@ -167,7 +167,8 @@ pub struct CsrWeights {
     pub data: Vec<f32>,
     pub n_rows: usize,
     pub n_cols: usize,
-    /// The entries packed (`pack`): column << 16 | `pack_weight(value)`, in place of
+    /// The entries packed (`pack`): column << 16 | `pack_weight(value)` below 65,536 columns,
+    /// column << 14 | `pack_weight_m::<8>(value)` up to 262,144 (`is_wide`), in place of
     /// `indices` and `data`, which are then empty. Empty when unpacked.
     pub packed: Vec<u32>,
 }
@@ -177,21 +178,30 @@ pub struct CsrWeights {
 /// for weights below 2^-40. Imputed R2 by MAF bin was unchanged to 4 decimals when every stored
 /// weight was rounded to 10 mantissa bits (1000 Genomes chr22, 801 targets, phased and unphased).
 #[inline]
-pub fn pack_weight(v: f32) -> u16 {
+pub fn pack_weight(v: f32) -> u16 { pack_weight_m::<10>(v) as u16 }
+
+#[inline]
+pub fn unpack_weight(c: u16) -> f32 { unpack_weight_m::<10>(c as u32) }
+
+/// [`pack_weight`] with `M` mantissa bits, in the low `6 + M` bits. A wide panel's columns take
+/// 18 bits and leave 8 (relative error <= 2^-9): R2 by MAF bin was unchanged to 4 decimals with
+/// every stored weight rounded to 7 mantissa bits (1000 Genomes chr22, 801 targets).
+#[inline]
+pub fn pack_weight_m<const M: u32>(v: f32) -> u32 {
     if !(v > 0.0) { return 0; }
+    let d = 23 - M;
     let b = v.to_bits();
-    let r = b + 0xfff + ((b >> 13) & 1);
+    let r = b + ((1 << (d - 1)) - 1) + ((b >> d) & 1);
     let e = (r >> 23) as i32 - 86;
     if e < 1 { return 0; }
-    if e > 63 { return 0xffff; }
-    ((e as u32) << 10 | ((r >> 13) & 0x3ff)) as u16
+    if e > 63 { return (1 << (6 + M)) - 1; }
+    (e as u32) << M | ((r >> d) & ((1 << M) - 1))
 }
 
 #[inline]
-pub fn unpack_weight(c: u16) -> f32 {
+pub fn unpack_weight_m<const M: u32>(c: u32) -> f32 {
     if c == 0 { return 0.0; }
-    let c = c as u32;
-    f32::from_bits((((c >> 10) + 86) << 23) | ((c & 0x3ff) << 13))
+    f32::from_bits((((c >> M) + 86) << 23) | ((c & ((1 << M) - 1)) << (23 - M)))
 }
 
 /// Read access to a CSR's entries in either form.
@@ -212,20 +222,46 @@ impl WeightEntries for PackedEntries<'_> {
     #[inline(always)] fn val(&self, k: usize) -> f32 { unpack_weight(self.0[k] as u16) }
 }
 
-/// Columns a packed CSR can address.
+pub struct WidePackedEntries<'a>(pub &'a [u32]);
+impl WeightEntries for WidePackedEntries<'_> {
+    #[inline(always)] fn col(&self, k: usize) -> usize { (self.0[k] >> 14) as usize }
+    #[inline(always)] fn val(&self, k: usize) -> f32 { unpack_weight_m::<8>(self.0[k] & 0x3fff) }
+}
+
+/// Columns the 16-bit-column packing can address.
 pub const PACK_MAX_COLS: usize = 1 << 16;
+/// Columns the wide (18-bit-column) packing can address; wider panels stay unpacked.
+pub const WIDE_PACK_MAX_COLS: usize = 1 << 18;
+
+/// Bytes a held weight entry takes on a panel of `n_cols` haplotypes, as a multiple of a packed one.
+pub fn held_entry_factor(n_cols: usize) -> usize { if n_cols < WIDE_PACK_MAX_COLS { 1 } else { 2 } }
 
 impl CsrWeights {
     pub fn nnz(&self) -> usize { self.data.len() + self.packed.len() }
 
     pub fn is_packed(&self) -> bool { !self.packed.is_empty() }
 
-    /// The same weights at 4 bytes an entry instead of 8 (`pack_weight`), when the panel has
-    /// fewer than 65,536 haplotypes; unchanged otherwise.
+    /// Packed entries hold an 18-bit column and a 14-bit weight (panels of 65,536 haplotypes or more).
+    pub fn is_wide(&self) -> bool { self.n_cols >= PACK_MAX_COLS }
+
+    #[inline]
+    fn packed_entry(&self, x: u32) -> (i32, f32) {
+        if self.is_wide() { ((x >> 14) as i32, unpack_weight_m::<8>(x & 0x3fff)) }
+        else { ((x >> 16) as i32, unpack_weight(x as u16)) }
+    }
+
+    #[inline]
+    fn pack_entry(&self, col: u32, v: f32) -> u32 {
+        if self.is_wide() { col << 14 | pack_weight_m::<8>(v) } else { col << 16 | pack_weight(v) as u32 }
+    }
+
+    /// The same weights at 4 bytes an entry instead of 8 (`pack_weight`; 18-bit columns and 8
+    /// mantissa bits from 65,536 haplotypes), when the panel has fewer than 262,144 haplotypes;
+    /// unchanged otherwise.
     pub fn pack(self) -> CsrWeights {
-        if self.n_cols >= PACK_MAX_COLS || self.is_packed() || self.data.is_empty() { return self; }
+        if self.n_cols >= WIDE_PACK_MAX_COLS || self.is_packed() || self.data.is_empty() { return self; }
         let packed: Vec<u32> = self.indices.iter().zip(&self.data)
-            .map(|(&i, &v)| (i as u32) << 16 | pack_weight(v) as u32).collect();
+            .map(|(&i, &v)| self.pack_entry(i as u32, v)).collect();
         CsrWeights { indptr: self.indptr, indices: Vec::new(), data: Vec::new(), n_rows: self.n_rows,
                      n_cols: self.n_cols, packed }
     }
@@ -233,8 +269,7 @@ impl CsrWeights {
     /// The plain form of a packed CSR (unchanged when unpacked).
     pub fn unpack(self) -> CsrWeights {
         if !self.is_packed() { return self; }
-        let indices = self.packed.iter().map(|&x| (x >> 16) as i32).collect();
-        let data = self.packed.iter().map(|&x| unpack_weight(x as u16)).collect();
+        let (indices, data) = self.packed.iter().map(|&x| self.packed_entry(x)).unzip();
         CsrWeights { indptr: self.indptr, indices, data, n_rows: self.n_rows, n_cols: self.n_cols, packed: Vec::new() }
     }
 
@@ -243,7 +278,7 @@ impl CsrWeights {
         let (s, e) = (self.indptr[r] as usize, self.indptr[r + 1] as usize);
         out.clear();
         if self.is_packed() {
-            out.extend(self.packed[s..e].iter().map(|&x| ((x >> 16) as i32, unpack_weight(x as u16))));
+            out.extend(self.packed[s..e].iter().map(|&x| self.packed_entry(x)));
         } else {
             out.extend(self.indices[s..e].iter().copied().zip(self.data[s..e].iter().copied()));
         }
@@ -254,7 +289,7 @@ impl CsrWeights {
     pub fn range_sum(&self, s: usize, e: usize) -> f32 {
         let mut x: f32 = 0.0;
         if self.is_packed() {
-            for k in s..e { x += unpack_weight(self.packed[k] as u16); }
+            for k in s..e { x += self.packed_entry(self.packed[k]).1; }
         } else {
             for k in s..e { x += self.data[k]; }
         }
@@ -264,9 +299,12 @@ impl CsrWeights {
     /// Every value times `f`.
     pub fn scale(&mut self, f: f32) {
         if self.is_packed() {
-            for x in self.packed.iter_mut() {
-                *x = (*x & 0xffff_0000) | pack_weight(unpack_weight(*x as u16) * f) as u32;
+            let mut packed = std::mem::take(&mut self.packed);
+            for x in packed.iter_mut() {
+                let (c, v) = self.packed_entry(*x);
+                *x = self.pack_entry(c as u32, v * f);
             }
+            self.packed = packed;
         } else {
             for v in self.data.iter_mut() { *v *= f; }
         }
@@ -2694,10 +2732,25 @@ mod allele_ls_tests {
         let mut h = w.clone();
         h.scale(0.5);
         assert_eq!(h.range_sum(0, 3), 1.0);
-        // A panel too wide for 16-bit columns stays unpacked.
-        let wide = CsrWeights { indptr: vec![0, 1], indices: vec![1], data: vec![1.0], n_rows: 1, n_cols: PACK_MAX_COLS,
-                                packed: Vec::new() }.pack();
-        assert!(!wide.is_packed());
+        // From 65,536 haplotypes: 18-bit columns, weights within 2^-9; from 262,144: unpacked.
+        let wide = CsrWeights { indptr: vec![0, 2], indices: vec![1, 200_000], data: vec![0.3, 1.7], n_rows: 1,
+                                n_cols: 200_001, packed: Vec::new() }.pack();
+        assert!(wide.is_packed() && wide.is_wide());
+        wide.row_entries(0, &mut row);
+        assert_eq!((row[0].0, row[1].0), (1, 200_000));
+        assert!(((row[0].1 - 0.3) / 0.3).abs() <= 1.0 / 512.0 && ((row[1].1 - 1.7) / 1.7).abs() <= 1.0 / 512.0);
+        let back = wide.clone().unpack();
+        assert_eq!((back.indices.clone(), back.data.clone()), (vec![1, 200_000], vec![row[0].1, row[1].1]));
+        let mut h = wide.clone();
+        h.scale(2.0);
+        assert!((h.range_sum(0, 2) - 2.0 * wide.range_sum(0, 2)).abs() <= 1e-6);
+        let widest = CsrWeights { indptr: vec![0, 1], indices: vec![1], data: vec![1.0], n_rows: 1, n_cols: WIDE_PACK_MAX_COLS,
+                                  packed: Vec::new() }.pack();
+        assert!(!widest.is_packed());
+        for &v in &[1.0f32, 0.000731, 3.7e-6, 1.2e-9, 2.999, 192.0] {
+            let u = unpack_weight_m::<8>(pack_weight_m::<8>(v));
+            assert!(((u - v) / v).abs() <= 1.0 / 512.0, "{v} -> {u}");
+        }
     }
 
     #[test]

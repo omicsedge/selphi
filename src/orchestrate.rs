@@ -1005,7 +1005,9 @@ pub fn run_multi_chr(
         // Compute imputation windows
         let windows = compute_imputation_windows_within(
             &chip_cm, config.window_cm, config.overlap_cm, selphi::imputation::windows::window_max_markers(),
-            if allele_ls { n_haps * selphi::imputation::windows::ALLELE_LS_MARKER_BYTES } else { 0 });
+            if allele_ls {
+                n_haps * selphi::imputation::hmm::held_entry_factor(n_ref) * selphi::imputation::windows::ALLELE_LS_MARKER_BYTES
+            } else { 0 });
         // Sites a fill read as reference at low panel frequency: out of the imputation HMM.
         let hmm_skip = selphi::io::variant_only::hmm_skip(&filled_mask, |c| ref_bm_imp.popcount_row(c, n_ref), n_ref);
 
