@@ -519,6 +519,55 @@ pub struct AlleleEm<'a> {
     pub target: &'a [u8],
     /// Window row of each HMM site when the HMM runs over a subset of the window (called sites).
     pub rows: Option<&'a [usize]>,
+    /// The window's panel alleles by haplotype ([`PanelCols`]), when the window has one.
+    pub cols: Option<&'a PanelCols>,
+}
+
+/// A window's panel alleles transposed: haplotype `h`'s alleles at window rows `0..n_rows` are
+/// bits `[h * words, (h + 1) * words)`. Built once per window for a cohort, it turns each target's
+/// [`MismatchMask`] into word XORs and 64 x 64 bit transposes instead of a bit read per state
+/// and site.
+pub struct PanelCols { words: usize, bits: Vec<u64> }
+
+impl PanelCols {
+    pub fn build(bm: &crate::common::HaplotypeBitmatrix, chip_start: usize, n_rows: usize, n_ref: usize) -> Self {
+        use rayon::prelude::*;
+        let words = n_rows.div_ceil(64).max(1);
+        let hap_blocks = n_ref.div_ceil(64);
+        let mut bits = vec![0u64; n_ref * words];
+        // One 64-haplotype block per task: its rows of `bits` are contiguous.
+        bits.par_chunks_mut(64 * words).enumerate().for_each(|(u, out)| {
+            debug_assert!(u < hap_blocks);
+            let n_h = (n_ref - 64 * u).min(64);
+            let mut a = [0u64; 64];
+            for w in 0..words {
+                let n_v = (n_rows - 64 * w).min(64);
+                for (i, x) in a.iter_mut().enumerate() {
+                    *x = if i < n_v { bm.row(chip_start + 64 * w + i)[u] } else { 0 };
+                }
+                transpose64(&mut a);
+                for c in 0..n_h { out[c * words + w] = a[c]; }
+            }
+        });
+        Self { words, bits }
+    }
+}
+
+/// In place: bit `j` of word `i` becomes bit `i` of word `j`.
+fn transpose64(a: &mut [u64; 64]) {
+    let mut j = 32usize;
+    let mut m: u64 = 0x0000_0000_FFFF_FFFF;
+    while j != 0 {
+        let mut k = 0usize;
+        while k < 64 {
+            let t = ((a[k] >> j) ^ a[k + j]) & m;
+            a[k] ^= t << j;
+            a[k + j] ^= t;
+            k = (k + j + 1) & !j;
+        }
+        j >>= 1;
+        m ^= m << j;
+    }
 }
 
 /// Per HMM site, the states whose (representative) haplotype carries the other allele, and the
@@ -530,6 +579,37 @@ impl MismatchMask {
     fn build(ae: &AlleleEm, state_to_hap: &[i64], n_sites: usize, conf: Option<&[f64]>) -> Self {
         let words = state_to_hap.len().div_ceil(64).max(1);
         let mut bits = vec![0u64; n_sites * words];
+        match ae.cols.filter(|_| ae.rows.is_none()) {
+            Some(pc) => Self::fill_from_cols(&mut bits, words, pc, ae.target, state_to_hap, n_sites),
+            None => Self::fill(&mut bits, words, ae, state_to_hap),
+        }
+        let factors = conf.filter(|c| c.iter().any(|&x| x < 1.0)).map(|c| {
+            c.iter().map(|&x| ALLELE_LS_MISMATCH + (1.0 - x.clamp(0.0, 1.0) as f32) * (1.0 - ALLELE_LS_MISMATCH)).collect()
+        });
+        Self { words, bits, factors }
+    }
+
+    /// The window's panel by haplotype XOR the target's alleles, 64 states x 64 sites at a time.
+    fn fill_from_cols(bits: &mut [u64], words: usize, pc: &PanelCols, target: &[u8], state_to_hap: &[i64], n_sites: usize) {
+        let site_words = n_sites.div_ceil(64);
+        debug_assert!(site_words <= pc.words);
+        let mut tw = vec![0u64; site_words];
+        for (v, &a) in target.iter().enumerate().take(n_sites) { tw[v >> 6] |= ((a & 1) as u64) << (v & 63); }
+        let mut a = [0u64; 64];
+        for (u, block) in state_to_hap.chunks(64).enumerate() {
+            for (w, &t) in tw.iter().enumerate() {
+                for (c, x) in a.iter_mut().enumerate() {
+                    *x = block.get(c).map_or(0, |&h| pc.bits[h as usize * pc.words + w] ^ t);
+                }
+                transpose64(&mut a);
+                for (b, &x) in a.iter().enumerate().take((n_sites - 64 * w).min(64)) {
+                    bits[(64 * w + b) * words + u] = x;
+                }
+            }
+        }
+    }
+
+    fn fill(bits: &mut [u64], words: usize, ae: &AlleleEm, state_to_hap: &[i64]) {
         for (v, out) in bits.chunks_exact_mut(words).enumerate() {
             let row = ae.bm.row(ae.chip_start + ae.rows.map_or(v, |r| r[v]));
             let t = (ae.target[v] & 1) as u64;
@@ -538,10 +618,6 @@ impl MismatchMask {
                 if (row[h >> 6] >> (h & 63)) & 1 != t { out[j >> 6] |= 1u64 << (j & 63); }
             }
         }
-        let factors = conf.filter(|c| c.iter().any(|&x| x < 1.0)).map(|c| {
-            c.iter().map(|&x| ALLELE_LS_MISMATCH + (1.0 - x.clamp(0.0, 1.0) as f32) * (1.0 - ALLELE_LS_MISMATCH)).collect()
-        });
-        Self { words, bits, factors }
     }
 
     #[inline]
@@ -2481,7 +2557,7 @@ mod allele_ls_tests {
         let state_to_hap: Vec<i64> = vec![0, 1, 2, 65, 66, 69];
         let target = [1u8, 0];
         let rows = [0usize, 2];
-        let ae = AlleleEm { bm: &bm, chip_start: 0, target: &target, rows: Some(&rows) };
+        let ae = AlleleEm { bm: &bm, chip_start: 0, target: &target, rows: Some(&rows), cols: None };
         let mm = MismatchMask::build(&ae, &state_to_hap, 2, Some(&[1.0, 0.0]));
         let mut r0 = vec![1.0f32; 6];
         mm.apply(0, &mut r0);
@@ -2497,6 +2573,25 @@ mod allele_ls_tests {
         let want1: Vec<f32> = state_to_hap.iter()
             .map(|&h| if (h + 2) % 3 == 0 { ALLELE_LS_MISMATCH } else { 1.0 }).collect();
         assert_eq!(r1, want1);
+    }
+
+    #[test]
+    fn mask_from_panel_cols_equals_the_bit_by_bit_mask() {
+        // 130 sites x 200 haps (pseudo-random alleles), 150 states in scrambled order, a window
+        // starting at row 3: the transposed build must set exactly the bits of the direct one.
+        let (n_rows, n_ref, start) = (130usize, 200usize, 3usize);
+        let bm = crate::common::HaplotypeBitmatrix::from_panel(n_rows + start, n_ref,
+            &|s, h| (s * 7919 + h * 104729 + (s * h) % 13) % 5 < 2, &vec![true; n_rows + start]);
+        let state_to_hap: Vec<i64> = (0..150).map(|j| ((j * 37 + 11) % n_ref) as i64).collect();
+        let target: Vec<u8> = (0..n_rows).map(|v| ((v * 31 + 7) % 3 == 0) as u8).collect();
+        let pc = PanelCols::build(&bm, start, n_rows, n_ref);
+        let slow = AlleleEm { bm: &bm, chip_start: start, target: &target, rows: None, cols: None };
+        let fast = AlleleEm { cols: Some(&pc), ..slow };
+        let a = MismatchMask::build(&slow, &state_to_hap, n_rows, None);
+        let b = MismatchMask::build(&fast, &state_to_hap, n_rows, None);
+        assert_eq!(a.words, b.words);
+        assert_eq!(a.bits, b.bits);
+        assert!(a.bits.iter().any(|&w| w != 0));
     }
 }
 

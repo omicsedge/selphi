@@ -81,6 +81,9 @@ pub struct CandidateAncestry<'a> {
 /// the window that needs them and reused by the others (member 0 and the folded
 /// members share the window's panel rows). Keyed by the panel matrix, the window
 /// and `n_ref`; a call with another key computes its own.
+/// Target haplotypes from which a window builds `hmm::PanelCols`.
+const PANEL_COLS_MIN_HAPS: usize = 64;
+
 #[derive(Default)]
 pub struct WindowClasses(std::sync::OnceLock<((usize, usize, usize, usize, usize), Vec<u32>)>);
 
@@ -1211,6 +1214,10 @@ pub fn process_window_hmm(
 
     // Every reference haplotype's exact allele class over this window, for the HMM dedup:
     // window-only, so computed once here rather than by every target.
+    // A cohort's targets build their allele-aware masks from the window's panel by haplotype
+    // (`hmm::PanelCols`); a few targets read the panel rows directly, cheaper than building it.
+    let panel_cols = (params.allele_ls && n_haps >= PANEL_COLS_MIN_HAPS)
+        .then(|| super::hmm::PanelCols::build(ref_bm, chip_start, n_var_w, n_ref));
     let own_classes;
     let classes: &[u32] = match shared_classes.and_then(|c| c.get(ref_bm, chip_start, n_var_w, n_ref)) {
         Some(c) => c,
@@ -1305,7 +1312,8 @@ pub fn process_window_hmm(
                 let mut r = super::hmm::run_weights(
                     &prep, &breaks, floor, None, conf_hap.as_deref(), params.compute_posterior, measure,
                     if called.is_none() { keep_rows } else { None },
-                    tgt_alleles.as_deref().map(|t| super::hmm::AlleleEm { bm: ref_bm, chip_start, target: t, rows: called }));
+                    tgt_alleles.as_deref().map(|t| super::hmm::AlleleEm { bm: ref_bm, chip_start, target: t, rows: called,
+                        cols: panel_cols.as_ref() }));
                 if let Some(sites) = called {
                     let x = interp_x_w.unwrap_or(cm_w);
                     r.weights = r.weights.into_iter()
