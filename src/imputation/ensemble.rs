@@ -205,9 +205,7 @@ enum AddRow<'b> {
 
 /// Row `r` of `csr` as (column, value) pairs sorted by column, into `out`.
 fn row_pairs(csr: &CsrWeights, r: usize, out: &mut Vec<(i32, f32)>) {
-    let (s, e) = (csr.indptr[r] as usize, csr.indptr[r + 1] as usize);
-    out.clear();
-    out.extend(csr.indices[s..e].iter().copied().zip(csr.data[s..e].iter().copied()));
+    csr.row_entries(r, out);
     if !out.windows(2).all(|w| w[0].0 < w[1].0) { out.sort_unstable_by_key(|&(c, _)| c); }
 }
 
@@ -215,10 +213,11 @@ fn row_pairs(csr: &CsrWeights, r: usize, out: &mut Vec<(i32, f32)>) {
 /// the row `window_process::expand_weights` writes for a skipped site between those rows.
 fn blend_row(l: &CsrWeights, lr: usize, r: &CsrWeights, rr: usize, t: f32, out: &mut Vec<(i32, f32)>) {
     let mut pairs: Vec<(i32, f32)> = Vec::new();
-    let (s, e) = (l.indptr[lr] as usize, l.indptr[lr + 1] as usize);
-    pairs.extend(l.indices[s..e].iter().zip(&l.data[s..e]).map(|(&i, &d)| (i, (1.0 - t) * d)));
-    let (s, e) = (r.indptr[rr] as usize, r.indptr[rr + 1] as usize);
-    pairs.extend(r.indices[s..e].iter().zip(&r.data[s..e]).map(|(&i, &d)| (i, t * d)));
+    let mut row: Vec<(i32, f32)> = Vec::new();
+    l.row_entries(lr, &mut row);
+    pairs.extend(row.iter().map(|&(i, d)| (i, (1.0 - t) * d)));
+    r.row_entries(rr, &mut row);
+    pairs.extend(row.iter().map(|&(i, d)| (i, t * d)));
     pairs.sort_unstable_by_key(|&(i, _)| i);
     out.clear();
     let mut j = 0;
@@ -242,8 +241,8 @@ fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWe
     let n_cols = a.n_cols;
     let mut indptr = Vec::with_capacity(n_rows + 1);
     // the addend's rows are the same size as `a`'s (same window, same panel): 2x reserves both
-    let mut indices: Vec<i32> = Vec::with_capacity(2 * a.indices.len());
-    let mut data: Vec<f32> = Vec::with_capacity(2 * a.data.len());
+    let mut indices: Vec<i32> = Vec::with_capacity(2 * a.nnz());
+    let mut data: Vec<f32> = Vec::with_capacity(2 * a.nnz());
     indptr.push(0i32);
     let (mut ia, mut ib): (Vec<(i32, f32)>, Vec<(i32, f32)>) = (Vec::new(), Vec::new());
     for r in 0..n_rows {
@@ -264,7 +263,11 @@ fn sum_rows_into<'b>(a: &CsrWeights, src: impl Fn(usize) -> AddRow<'b>) -> CsrWe
         for &(c, v) in &ib[k..] { indices.push(c); data.push(v); }
         indptr.push(indices.len() as i32);
     }
-    CsrWeights { indptr, indices: exact_size(indices), data: exact_size(data), n_rows, n_cols }
+    // A packed sum stays packed: it is the copy held until the window is written.
+    if a.is_packed() {
+        return CsrWeights { indptr, indices, data, n_rows, n_cols, packed: Vec::new() }.pack();
+    }
+    CsrWeights { indptr, indices: exact_size(indices), data: exact_size(data), n_rows, n_cols, packed: Vec::new() }
 }
 
 /// `v` within an eighth of its size: kept when its room is that full (operands sharing few
@@ -511,7 +514,7 @@ fn divide(all_weights: &mut [Vec<(usize, CsrWeights)>], count: usize) {
     let inv = 1.0f32 / count as f32;
     for hw in all_weights.iter_mut() {
         for (_, csr) in hw.iter_mut() {
-            for v in csr.data.iter_mut() { *v *= inv; }
+            csr.scale(inv);
         }
     }
 }
@@ -600,7 +603,7 @@ mod tests {
     /// Diagonal CSR: row r has one weight `v` on column r.
     fn diag(n: usize, v: f32) -> CsrWeights {
         CsrWeights { indptr: (0..=n as i32).collect(), indices: (0..n as i32).collect(),
-                     data: vec![v; n], n_rows: n, n_cols: n }
+                     data: vec![v; n], n_rows: n, n_cols: n, packed: Vec::new() }
     }
 
     /// A stacked member holds each scaffold as a block of columns (block b's haplotype h at
@@ -695,13 +698,13 @@ mod tests {
     fn expanded(row0: (i32, f32), row2: (i32, f32), t: f32) -> CsrWeights {
         let mut m = vec![row0, row2];
         let mut mid: Vec<(i32, f32)> = Vec::new();
-        let a = CsrWeights { indptr: vec![0, 1, 2], indices: vec![row0.0, row2.0], data: vec![row0.1, row2.1], n_rows: 2, n_cols: 8 };
+        let a = CsrWeights { indptr: vec![0, 1, 2], indices: vec![row0.0, row2.0], data: vec![row0.1, row2.1], n_rows: 2, n_cols: 8, packed: Vec::new() };
         blend_row(&a, 0, &a, 1, t, &mut mid);
         m.splice(1..1, mid.iter().copied());
         let mut indptr = vec![0i32, 1];
         indptr.push(1 + mid.len() as i32);
         indptr.push(2 + mid.len() as i32);
-        CsrWeights { indptr, indices: m.iter().map(|p| p.0).collect(), data: m.iter().map(|p| p.1).collect(), n_rows: 3, n_cols: 8 }
+        CsrWeights { indptr, indices: m.iter().map(|p| p.0).collect(), data: m.iter().map(|p| p.1).collect(), n_rows: 3, n_cols: 8, packed: Vec::new() }
     }
 
     #[test]

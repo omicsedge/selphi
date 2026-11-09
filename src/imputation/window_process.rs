@@ -510,8 +510,7 @@ fn uniform_weights(n_ref: usize, n_var: usize, p_err: f64) -> HmmResult {
         indptr: (0..=n_var).map(|v| (v * n_ref) as i32).collect(),
         indices: (0..n_var).flat_map(|_| 0..n_ref as i32).collect(),
         data: vec![w; n_ref * n_var],
-        n_rows: n_var, n_cols: n_ref,
-    };
+        n_rows: n_var, n_cols: n_ref, packed: Vec::new() };
     HmmResult { weights: vec![(0, weights)], hap_posterior: Some(Vec::new()), perr_floor: p_err, p_err, unmatched: None }
 }
 
@@ -550,6 +549,7 @@ fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], x: &[f64], n_var: 
 {
     let row = |r: usize| {
         let (a, b) = (w.indptr[r] as usize, w.indptr[r + 1] as usize);
+        debug_assert!(!w.is_packed(), "called sites are expanded before the weights are packed");
         (&w.indices[a..b], &w.data[a..b])
     };
     let mut indptr = Vec::with_capacity(n_var + 1);
@@ -588,7 +588,7 @@ fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], x: &[f64], n_var: 
         }
         indptr.push(indices.len() as i32);
     }
-    super::hmm::CsrWeights { indptr, indices, data, n_rows: n_var, n_cols: w.n_cols }
+    super::hmm::CsrWeights { indptr, indices, data, n_rows: n_var, n_cols: w.n_cols, packed: Vec::new() }
 }
 
 // ONE allele row of scratch (m bytes), not n_var of them — see pbwt::AlleleRows
@@ -1356,6 +1356,11 @@ pub fn process_window_hmm(
             let mut r = hmm(tgt, csc, called, &carried);
             let measured = carry_update(&mut carried, &mut r, adapt.is_some());
             drop(carried);
+            // The allele-aware model keeps ~4x the entries of the match-set model: held until the
+            // window is written, they are packed to half the bytes (`CsrWeights::pack`).
+            if params.allele_ls {
+                r.weights = r.weights.into_iter().map(|(st, w)| (st, w.pack())).collect();
+            }
             let weights = match sink {
                 Some(s) => { s(tgt, r.weights); None }
                 None => Some(r.weights),
@@ -1661,7 +1666,7 @@ mod expand_tests {
     #[test]
     fn a_skipped_row_is_blended_in_the_given_coordinate() {
         // called rows 0 and 2 (one donor each); row 1 skipped, at 0.1 of the way in x
-        let w = CsrWeights { indptr: vec![0, 1, 2], indices: vec![0, 1], data: vec![1.0, 1.0], n_rows: 2, n_cols: 2 };
+        let w = CsrWeights { indptr: vec![0, 1, 2], indices: vec![0, 1], data: vec![1.0, 1.0], n_rows: 2, n_cols: 2, packed: Vec::new() };
         let e = expand_weights(w, &[0, 2], &[0.0, 0.1, 1.0], 3);
         assert_eq!(e.indptr, vec![0, 1, 3, 4]);
         assert_eq!(e.indices, vec![0, 0, 1, 1]);

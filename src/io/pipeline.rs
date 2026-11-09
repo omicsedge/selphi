@@ -13,7 +13,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::srp::SrpReader;
-use crate::imputation::hmm::CsrWeights;
+use crate::imputation::hmm::{CsrWeights, PackedEntries, PlainEntries, WeightEntries};
 
 // ---------------------------------------------------------------------------
 // Shared types for multi-format output
@@ -439,8 +439,7 @@ mod interval_tests {
                 indptr: (0..=nrows).map(|i| (2 * i) as i32).collect(),
                 indices: (0..nrows).flat_map(|_| [0, 1]).collect(),
                 data: donor_weights[start..start + nrows].iter().flatten().copied().collect(),
-                n_rows: nrows, n_cols: 2,
-            };
+                n_rows: nrows, n_cols: 2, packed: Vec::new() };
             let t = cm_t_values(&cm, iv.wgs_start, iv.wgs_end, pos - iv.wgs_start, 1)
                 .unwrap_or_else(|| vec![(pos - iv.wgs_start) as f32 / (iv.wgs_end - iv.wgs_start) as f32]);
             interpolate_tile_preloaded(&chunks, 0, &[&weights], iv.weight_s, iv.weight_e,
@@ -2306,9 +2305,9 @@ fn interp_kernel(
             let e2 = w.indptr[chip_e + 1] as usize;
 
             let mut ss: f32 = 0.0;
-            for j in s1..e1 { ss += w.data[j]; }
+            ss += w.range_sum(s1, e1);
             let mut es: f32 = 0.0;
-            for j in s2..e2 { es += w.data[j]; }
+            es += w.range_sum(s2, e2);
             let ds = es - ss;
 
             if ss == 0.0 && ds == 0.0 { return; }
@@ -2320,7 +2319,11 @@ fn interp_kernel(
                 // Fused scatter: accumulate ws*(1-t[v]) + we*t[v] = ws + t[v]*(we-ws)
                 // for each reference column with allele=1 at variant v.
                 // Merge start and end weight ranges by column index.
-                scatter_fused(w, s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
+                if w.is_packed() {
+                    scatter_fused(&PackedEntries(&w.packed), s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
+                } else {
+                    scatter_fused(&PlainEntries(&w.indices, &w.data), s1, e1, s2, e2, chunk, row_offset, row_end, t, &mut num);
+                }
 
                 // Final division: out[v] = num[v] / (ss + t[v] * ds).
                 // Guard den==0 (matches the tiled path) — defends against NaN/Inf
@@ -2338,8 +2341,8 @@ fn interp_kernel(
 /// ws + t[v]*(we-ws) for each column's non-zero rows.
 /// Single pass over CSC columns — halves the random access compared to 2× scatter.
 #[inline(always)]
-fn scatter_fused(
-    w: &CsrWeights,
+fn scatter_fused<E: WeightEntries>(
+    w: &E,
     s1: usize, e1: usize,  // start weight range
     s2: usize, e2: usize,  // end weight range
     chunk: &crate::srp::CscChunk,
@@ -2353,23 +2356,23 @@ fn scatter_fused(
     let mut j = s2;
 
     while i < e1 && j < e2 {
-        let ci = w.indices[i] as usize;
-        let cj = w.indices[j] as usize;
+        let ci = w.col(i);
+        let cj = w.col(j);
 
         if ci < cj {
             // Column only in start weights: accumulate ws * (1-t[v])
-            let ws = w.data[i];
+            let ws = w.val(i);
             scatter_col_weighted(chunk, ci, row_offset, row_end, t, accum, ws, -ws);
             i += 1;
         } else if ci > cj {
             // Column only in end weights: accumulate we * t[v]
-            let we = w.data[j];
+            let we = w.val(j);
             scatter_col_weighted(chunk, cj, row_offset, row_end, t, accum, 0.0, we);
             j += 1;
         } else {
             // Same column in both: accumulate ws + t*(we-ws)
-            let ws = w.data[i];
-            let we = w.data[j];
+            let ws = w.val(i);
+            let we = w.val(j);
             scatter_col_weighted(chunk, ci, row_offset, row_end, t, accum, ws, we - ws);
             i += 1;
             j += 1;
@@ -2377,14 +2380,14 @@ fn scatter_fused(
     }
     // Remaining start-only columns
     while i < e1 {
-        let ws = w.data[i];
-        scatter_col_weighted(chunk, w.indices[i] as usize, row_offset, row_end, t, accum, ws, -ws);
+        let ws = w.val(i);
+        scatter_col_weighted(chunk, w.col(i), row_offset, row_end, t, accum, ws, -ws);
         i += 1;
     }
     // Remaining end-only columns
     while j < e2 {
-        let we = w.data[j];
-        scatter_col_weighted(chunk, w.indices[j] as usize, row_offset, row_end, t, accum, 0.0, we);
+        let we = w.val(j);
+        scatter_col_weighted(chunk, w.col(j), row_offset, row_end, t, accum, 0.0, we);
         j += 1;
     }
 }
@@ -2501,20 +2504,21 @@ fn interpolate_tile_rows(
             let s2 = w.indptr[chip_e] as usize;
             let e2 = w.indptr[chip_e + 1] as usize;
             let mut ss: f32 = 0.0;
-            for j in s1..e1 { ss += w.data[j]; }
+            ss += w.range_sum(s1, e1);
             let mut es: f32 = 0.0;
-            for j in s2..e2 { es += w.data[j]; }
+            es += w.range_sum(s2, e2);
             let ds = es - ss;
             if ss == 0.0 && ds == 0.0 { return; }
 
             for sov in &sovs {
-                scatter_fused_tiled(
-                    w, s1, e1, s2, e2,
-                    sov.tiles, n_tile_cols,
-                    sov.lr_start, sov.lr_end,
-                    &t[sov.out_off..sov.out_off + sov.ov_n],
-                    &mut hap_out[sov.out_off..sov.out_off + sov.ov_n],
-                );
+                let (tt, out) = (&t[sov.out_off..sov.out_off + sov.ov_n], &mut hap_out[sov.out_off..sov.out_off + sov.ov_n]);
+                if w.is_packed() {
+                    scatter_fused_tiled(&PackedEntries(&w.packed), s1, e1, s2, e2, sov.tiles, n_tile_cols,
+                                        sov.lr_start, sov.lr_end, tt, out);
+                } else {
+                    scatter_fused_tiled(&PlainEntries(&w.indices, &w.data), s1, e1, s2, e2, sov.tiles, n_tile_cols,
+                                        sov.lr_start, sov.lr_end, tt, out);
+                }
             }
 
             for v in 0..tile_n {
@@ -2535,8 +2539,8 @@ const PAR_TILE_VALUES: usize = 1 << 16;
 
 /// Fused scatter from tiled format: merge start/end weight ranges, scatter from tiles.
 #[inline(always)]
-fn scatter_fused_tiled(
-    w: &CsrWeights,
+fn scatter_fused_tiled<E: WeightEntries>(
+    w: &E,
     s1: usize, e1: usize,
     s2: usize, e2: usize,
     tiles: &[crate::srp::SparseTile],
@@ -2549,33 +2553,33 @@ fn scatter_fused_tiled(
     let mut j = s2;
 
     while i < e1 && j < e2 {
-        let ci = w.indices[i] as usize;
-        let cj = w.indices[j] as usize;
+        let ci = w.col(i);
+        let cj = w.col(j);
 
         if ci < cj {
-            let ws = w.data[i];
+            let ws = w.val(i);
             scatter_col_tiled(tiles, ci, n_tile_cols, row_start, row_end, t, accum, ws, -ws);
             i += 1;
         } else if ci > cj {
-            let we = w.data[j];
+            let we = w.val(j);
             scatter_col_tiled(tiles, cj, n_tile_cols, row_start, row_end, t, accum, 0.0, we);
             j += 1;
         } else {
-            let ws = w.data[i];
-            let we = w.data[j];
+            let ws = w.val(i);
+            let we = w.val(j);
             scatter_col_tiled(tiles, ci, n_tile_cols, row_start, row_end, t, accum, ws, we - ws);
             i += 1;
             j += 1;
         }
     }
     while i < e1 {
-        let ws = w.data[i];
-        scatter_col_tiled(tiles, w.indices[i] as usize, n_tile_cols, row_start, row_end, t, accum, ws, -ws);
+        let ws = w.val(i);
+        scatter_col_tiled(tiles, w.col(i), n_tile_cols, row_start, row_end, t, accum, ws, -ws);
         i += 1;
     }
     while j < e2 {
-        let we = w.data[j];
-        scatter_col_tiled(tiles, w.indices[j] as usize, n_tile_cols, row_start, row_end, t, accum, 0.0, we);
+        let we = w.val(j);
+        scatter_col_tiled(tiles, w.col(j), n_tile_cols, row_start, row_end, t, accum, 0.0, we);
         j += 1;
     }
 }
@@ -3573,7 +3577,7 @@ mod encode_equivalence_tests {
                     }
                     indptr.push(indices.len() as i32);
                 }
-                CsrWeights { indptr, indices, data, n_rows: n_anchor, n_cols: n_ref_haps }
+                CsrWeights { indptr, indices, data, n_rows: n_anchor, n_cols: n_ref_haps, packed: Vec::new() }
             }).collect();
             let wref: Vec<&CsrWeights> = weights.iter().collect();
             for _ in 0..5 {

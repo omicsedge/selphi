@@ -1860,8 +1860,8 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         let all_weights = hmm_output.all_weights;
         selphi_debug!("  [MEM] win{} after HMM (member 0): rss={:.0} MB peak={:.0} MB, weights {:.0} MB ({:.0} MB allocated)",
             wi + 1, selphi::log::rss_mb(), selphi::log::peak_mem_mb(),
-            all_weights.iter().flatten().map(|(_, w)| 4 * (w.indptr.len() + w.indices.len() + w.data.len())).sum::<usize>() as f64 / 1048576.0,
-            all_weights.iter().flatten().map(|(_, w)| 4 * (w.indptr.capacity() + w.indices.capacity() + w.data.capacity())).sum::<usize>() as f64 / 1048576.0);
+            all_weights.iter().flatten().map(|(_, w)| 4 * (w.indptr.len() + w.indices.len() + w.data.len() + w.packed.len())).sum::<usize>() as f64 / 1048576.0,
+            all_weights.iter().flatten().map(|(_, w)| 4 * (w.indptr.capacity() + w.indices.capacity() + w.data.capacity() + w.packed.capacity())).sum::<usize>() as f64 / 1048576.0);
 
         let hmm_secs = t0_hmm.elapsed().as_secs_f64();
         let cpu_hmm = selphi::log::cpu_time_secs();

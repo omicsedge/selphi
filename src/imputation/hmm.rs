@@ -167,15 +167,108 @@ pub struct CsrWeights {
     pub data: Vec<f32>,
     pub n_rows: usize,
     pub n_cols: usize,
+    /// The entries packed (`pack`): column << 16 | `pack_weight(value)`, in place of
+    /// `indices` and `data`, which are then empty. Empty when unpacked.
+    pub packed: Vec<u32>,
 }
 
+/// A weight in 16 bits: 5-bit exponent over [2^-24, 2^8), 11-bit mantissa rounded to nearest
+/// (relative error <= 2^-12); 0 for zero and for weights below 2^-24. Imputed R2 by MAF bin was
+/// unchanged to 4 decimals when every stored weight was rounded to 11 mantissa bits (1000
+/// Genomes chr22, 801 targets).
+#[inline]
+pub fn pack_weight(v: f32) -> u16 {
+    if !(v > 0.0) { return 0; }
+    let b = v.to_bits();
+    let r = b + 0x7ff + ((b >> 12) & 1);
+    let e = (r >> 23) as i32 - 102;
+    if e < 1 { return 0; }
+    if e > 31 { return 0xffff; }
+    ((e as u32) << 11 | ((r >> 12) & 0x7ff)) as u16
+}
+
+#[inline]
+pub fn unpack_weight(c: u16) -> f32 {
+    if c == 0 { return 0.0; }
+    let c = c as u32;
+    f32::from_bits((((c >> 11) + 102) << 23) | ((c & 0x7ff) << 12))
+}
+
+/// Read access to a CSR's entries in either form.
+pub trait WeightEntries {
+    fn col(&self, k: usize) -> usize;
+    fn val(&self, k: usize) -> f32;
+}
+
+pub struct PlainEntries<'a>(pub &'a [i32], pub &'a [f32]);
+impl WeightEntries for PlainEntries<'_> {
+    #[inline(always)] fn col(&self, k: usize) -> usize { self.0[k] as usize }
+    #[inline(always)] fn val(&self, k: usize) -> f32 { self.1[k] }
+}
+
+pub struct PackedEntries<'a>(pub &'a [u32]);
+impl WeightEntries for PackedEntries<'_> {
+    #[inline(always)] fn col(&self, k: usize) -> usize { (self.0[k] >> 16) as usize }
+    #[inline(always)] fn val(&self, k: usize) -> f32 { unpack_weight(self.0[k] as u16) }
+}
+
+/// Columns a packed CSR can address.
+pub const PACK_MAX_COLS: usize = 1 << 16;
+
 impl CsrWeights {
-    pub fn nnz(&self) -> usize { self.data.len() }
+    pub fn nnz(&self) -> usize { self.data.len() + self.packed.len() }
+
+    pub fn is_packed(&self) -> bool { !self.packed.is_empty() }
+
+    /// The same weights at 4 bytes an entry instead of 8 (`pack_weight`), when the panel has
+    /// fewer than 65,536 haplotypes; unchanged otherwise.
+    pub fn pack(self) -> CsrWeights {
+        if self.n_cols >= PACK_MAX_COLS || self.is_packed() || self.data.is_empty() { return self; }
+        let packed: Vec<u32> = self.indices.iter().zip(&self.data)
+            .map(|(&i, &v)| (i as u32) << 16 | pack_weight(v) as u32).collect();
+        CsrWeights { indptr: self.indptr, indices: Vec::new(), data: Vec::new(), n_rows: self.n_rows,
+                     n_cols: self.n_cols, packed }
+    }
+
+    /// Row `r`'s entries as (column, value), in stored order, into `out`.
+    pub fn row_entries(&self, r: usize, out: &mut Vec<(i32, f32)>) {
+        let (s, e) = (self.indptr[r] as usize, self.indptr[r + 1] as usize);
+        out.clear();
+        if self.is_packed() {
+            out.extend(self.packed[s..e].iter().map(|&x| ((x >> 16) as i32, unpack_weight(x as u16))));
+        } else {
+            out.extend(self.indices[s..e].iter().copied().zip(self.data[s..e].iter().copied()));
+        }
+    }
+
+    /// Sum of the values of entries `[s, e)`, in order.
+    #[inline]
+    pub fn range_sum(&self, s: usize, e: usize) -> f32 {
+        let mut x: f32 = 0.0;
+        if self.is_packed() {
+            for k in s..e { x += unpack_weight(self.packed[k] as u16); }
+        } else {
+            for k in s..e { x += self.data[k]; }
+        }
+        x
+    }
+
+    /// Every value times `f`.
+    pub fn scale(&mut self, f: f32) {
+        if self.is_packed() {
+            for x in self.packed.iter_mut() {
+                *x = (*x & 0xffff_0000) | pack_weight(unpack_weight(*x as u16) * f) as u32;
+            }
+        } else {
+            for v in self.data.iter_mut() { *v *= f; }
+        }
+    }
 
     /// The rows `keep` marks (window rows, all of this CSR's), every other row left empty.
     /// Unchanged when every row is kept.
     pub fn keep_rows(self, keep: &[bool]) -> CsrWeights {
         if keep.iter().take(self.n_rows).all(|&k| k) { return self; }
+        debug_assert!(!self.is_packed(), "rows are kept before the weights are packed");
         // Sized exactly, as the CSR it replaces was: every haplotype's weights are held until
         // the window is written, so grown (up to twice too large) buffers would cost memory.
         let kept = |r: usize| keep.get(r).copied().unwrap_or(true);
@@ -192,7 +285,7 @@ impl CsrWeights {
             }
             indptr.push(indices.len() as i32);
         }
-        CsrWeights { indptr, indices, data, n_rows: self.n_rows, n_cols: self.n_cols }
+        CsrWeights { indptr, indices, data, n_rows: self.n_rows, n_cols: self.n_cols, packed: Vec::new() }
     }
 }
 
@@ -1478,7 +1571,7 @@ fn streaming_backward_combine(
 
     // Return the row scratch to the thread-local for reuse
     TL_WGT_BUF.with(|buf| { *buf.borrow_mut() = w_row; });
-    CsrWeights { indptr, indices, data, n_rows, n_cols: n_hid }
+    CsrWeights { indptr, indices, data, n_rows, n_cols: n_hid, packed: Vec::new() }
 }
 
 // ---------------------------------------------------------------------------
@@ -2609,7 +2702,7 @@ mod unmatched_tests {
             data.extend([0.9f32, 0.1]);
             indptr.push(indices.len() as i32);
         }
-        let csr = CsrWeights { indptr, indices, data, n_rows: n, n_cols: 4 };
+        let csr = CsrWeights { indptr, indices, data, n_rows: n, n_cols: 4, packed: Vec::new() };
         (vec![(0, csr)], vec![vec![0u32]; n], vec![0, 1, 2, 3])
     }
 
