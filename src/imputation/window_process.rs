@@ -1232,6 +1232,7 @@ pub fn process_window_hmm(
     let carry_cells: Vec<std::sync::Mutex<&mut HapCarry>> = carry.iter_mut().map(std::sync::Mutex::new).collect();
     // A haplotype's weights go to the sink, if there is one, as soon as they are done.
     let sink = match &weights_out { WeightsOut::Each(s) => Some(*s), _ => None };
+    let pack_kept = params.allele_ls && matches!(weights_out, WeightsOut::Collect);
     for batch_start in (0..n_haps).step_by(batch_size) {
         let batch_end = (batch_start + batch_size).min(n_haps);
         let ctx = PbwtCtx {
@@ -1357,8 +1358,10 @@ pub fn process_window_hmm(
             let measured = carry_update(&mut carried, &mut r, adapt.is_some());
             drop(carried);
             // The allele-aware model keeps ~4x the entries of the match-set model: held until the
-            // window is written, they are packed to half the bytes (`CsrWeights::pack`).
-            if params.allele_ls {
+            // window is written, they are packed to half the bytes (`CsrWeights::pack`). A
+            // member's weights folded on the fly stay exact: the fold recognises a no-call row as
+            // its anchors' blend by equality (`ensemble::mixed_rows`).
+            if pack_kept {
                 r.weights = r.weights.into_iter().map(|(st, w)| (st, w.pack())).collect();
             }
             let weights = match sink {

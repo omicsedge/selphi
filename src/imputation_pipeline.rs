@@ -1450,7 +1450,11 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
     // 8. Compute imputation windows
     let windows = compute_imputation_windows_within(
         &chip_cm, args.window_cm, args.overlap_cm, selphi::imputation::windows::window_max_markers(),
-        if allele_ls { n_haps * selphi::imputation::windows::ALLELE_LS_MARKER_BYTES } else { 0 });
+        // Weights are held for one sample batch at a time when the run streams batches.
+        if allele_ls {
+            let held = if args.sample_batch_size > 0 { n_haps.min(2 * args.sample_batch_size) } else { n_haps };
+            held * selphi::imputation::windows::ALLELE_LS_MARKER_BYTES
+        } else { 0 });
     // Sites a fill read as reference at low panel frequency: out of the imputation HMM.
     let hmm_skip = selphi::io::variant_only::hmm_skip(&filled_mask, |c| ref_bm_imp.popcount_row(c, n_ref), n_ref);
     selphi_debug!("  Windows: {} ({}cM, {}cM overlap)", windows.len(), args.window_cm, args.overlap_cm);

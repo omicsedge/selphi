@@ -172,26 +172,26 @@ pub struct CsrWeights {
     pub packed: Vec<u32>,
 }
 
-/// A weight in 16 bits: 5-bit exponent over [2^-24, 2^8), 11-bit mantissa rounded to nearest
-/// (relative error <= 2^-12); 0 for zero and for weights below 2^-24. Imputed R2 by MAF bin was
-/// unchanged to 4 decimals when every stored weight was rounded to 11 mantissa bits (1000
-/// Genomes chr22, 801 targets).
+/// A weight in 16 bits: 6-bit exponent over [2^-40, 2^23), so a sum over any number of ensemble
+/// members fits, and a 10-bit mantissa rounded to nearest (relative error <= 2^-11); 0 for zero and
+/// for weights below 2^-40. Imputed R2 by MAF bin was unchanged to 4 decimals when every stored
+/// weight was rounded to 10 mantissa bits (1000 Genomes chr22, 801 targets, phased and unphased).
 #[inline]
 pub fn pack_weight(v: f32) -> u16 {
     if !(v > 0.0) { return 0; }
     let b = v.to_bits();
-    let r = b + 0x7ff + ((b >> 12) & 1);
-    let e = (r >> 23) as i32 - 102;
+    let r = b + 0xfff + ((b >> 13) & 1);
+    let e = (r >> 23) as i32 - 86;
     if e < 1 { return 0; }
-    if e > 31 { return 0xffff; }
-    ((e as u32) << 11 | ((r >> 12) & 0x7ff)) as u16
+    if e > 63 { return 0xffff; }
+    ((e as u32) << 10 | ((r >> 13) & 0x3ff)) as u16
 }
 
 #[inline]
 pub fn unpack_weight(c: u16) -> f32 {
     if c == 0 { return 0.0; }
     let c = c as u32;
-    f32::from_bits((((c >> 11) + 102) << 23) | ((c & 0x7ff) << 12))
+    f32::from_bits((((c >> 10) + 86) << 23) | ((c & 0x3ff) << 13))
 }
 
 /// Read access to a CSR's entries in either form.
@@ -2669,12 +2669,13 @@ mod allele_ls_tests {
     }
 
     #[test]
-    fn packed_weights_keep_columns_and_values_within_2_pow_minus_12() {
-        for &v in &[1.0f32, 0.5, 0.000731, 3.7e-6, 1.0 / 1339.0, 2.999, 100.0] {
+    fn packed_weights_keep_columns_and_values_within_2_pow_minus_11() {
+        // Down to a dedup share, up to a 256-member ensemble sum and beyond.
+        for &v in &[1.0f32, 0.5, 0.000731, 3.7e-6, 1.2e-9, 1.0 / 1339.0, 2.999, 100.0, 192.0, 1.0e6] {
             let u = unpack_weight(pack_weight(v));
-            assert!(((u - v) / v).abs() <= 1.0 / 4096.0, "{v} -> {u}");
+            assert!(((u - v) / v).abs() <= 1.0 / 2048.0, "{v} -> {u}");
         }
-        assert_eq!((pack_weight(0.0), pack_weight(1e-9), unpack_weight(0)), (0, 0, 0.0));
+        assert_eq!((pack_weight(0.0), pack_weight(1e-13), unpack_weight(0)), (0, 0, 0.0));
         let w = CsrWeights { indptr: vec![0, 2, 3], indices: vec![7, 40000, 3], data: vec![0.25, 0.75, 1.0],
                              n_rows: 2, n_cols: 50000, packed: Vec::new() }.pack();
         assert!(w.is_packed() && w.indices.is_empty() && w.data.is_empty());

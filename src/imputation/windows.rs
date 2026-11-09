@@ -63,8 +63,9 @@ pub fn compute_imputation_windows_within(
     let fit = (budget_mb << 20) / marker_bytes;
     let most = windows.iter().map(|w| w.chip_end - w.chip_start).max().unwrap_or(0);
     if most <= fit { return windows; }
-    let per = most.div_ceil(most.div_ceil(fit.max(1)));
-    // Room for the overlap (an eighth of the cap) so the cut lands near the middle.
+    // Each window holds its share plus an overlap of up to an eighth of it: shares of 8/9 of what fits.
+    let share = (fit * 8 / 9).max(1);
+    let per = most.div_ceil(most.div_ceil(share));
     let cap = (per + per / 8).max(8 * MIN_WINDOW_MARKERS);
     let cap = if max_markers == 0 { cap } else { cap.min(max_markers) };
     compute_imputation_windows(chip_cm, window_cm, overlap_cm, cap)
@@ -303,5 +304,10 @@ mod tiling_tests {
         assert!(cut.iter().all(|w| w.chip_end - w.chip_start <= 1280));
         assert_eq!((cut[0].own_chip_start, cut[1].own_chip_end), (0, 2000));
         assert_eq!(cut[0].own_chip_end, cut[1].own_chip_start);
+        // 12,000 markers at 801 targets x 544 B: every window within the 5 GiB budget, overlap included.
+        let cm: Vec<f64> = (0..12_000).map(|i| i as f64 * 0.001).collect();
+        let fit = (DEFAULT_WINDOW_WEIGHT_BUDGET_MB << 20) / (1602 * ALLELE_LS_MARKER_BYTES);
+        let cut = compute_imputation_windows_within(&cm, 80.0, 2.0, 100_000, 1602 * ALLELE_LS_MARKER_BYTES);
+        assert!(cut.len() >= 2 && cut.iter().all(|w| w.chip_end - w.chip_start <= fit), "{fit}");
     }
 }
