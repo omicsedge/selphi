@@ -38,6 +38,38 @@ pub fn window_max_markers() -> usize {
         .unwrap_or(DEFAULT_WINDOW_MAX_MARKERS)
 }
 
+/// Bytes the allele-aware model holds per typed marker of a target haplotype until its window
+/// is written: ~136 packed weights of 4 bytes (1000 Genomes chr22, 4,802-haplotype panel; the
+/// match-set model holds ~34 of 8 bytes). A larger panel has more states per target and may hold
+/// more, so the budget is approximate there.
+pub const ALLELE_LS_MARKER_BYTES: usize = 544;
+
+/// Most bytes of weights a window may hold for all target haplotypes under the allele-aware model
+/// (`SELPHI_WINDOW_WEIGHT_BUDGET_MB`): a cohort's window that would hold more is cut into equal
+/// windows that do not. 5 GiB keeps 801 targets on 1000 Genomes chr22 near the match-set
+/// model's peak (one window there: 4.0 GB of weights).
+pub const DEFAULT_WINDOW_WEIGHT_BUDGET_MB: usize = 5 * 1024;
+
+/// [`compute_imputation_windows`], with windows that would hold more than the weight budget
+/// ([`DEFAULT_WINDOW_WEIGHT_BUDGET_MB`]) at `marker_bytes` per typed marker cut into as few equal
+/// windows as fit it. `marker_bytes` 0: no budget.
+pub fn compute_imputation_windows_within(
+    chip_cm: &[f64], window_cm: f64, overlap_cm: f64, max_markers: usize, marker_bytes: usize,
+) -> Vec<ImputationWindow> {
+    let windows = compute_imputation_windows(chip_cm, window_cm, overlap_cm, max_markers);
+    let budget_mb = crate::config::raw("SELPHI_WINDOW_WEIGHT_BUDGET_MB")
+        .and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(DEFAULT_WINDOW_WEIGHT_BUDGET_MB);
+    if marker_bytes == 0 || budget_mb == 0 { return windows; }
+    let fit = (budget_mb << 20) / marker_bytes;
+    let most = windows.iter().map(|w| w.chip_end - w.chip_start).max().unwrap_or(0);
+    if most <= fit { return windows; }
+    let per = most.div_ceil(most.div_ceil(fit.max(1)));
+    // Room for the overlap (an eighth of the cap) so the cut lands near the middle.
+    let cap = (per + per / 8).max(8 * MIN_WINDOW_MARKERS);
+    let cap = if max_markers == 0 { cap } else { cap.min(max_markers) };
+    compute_imputation_windows(chip_cm, window_cm, overlap_cm, cap)
+}
+
 /// Compute overlapping imputation windows from LD-corrected cM coordinates.
 ///
 /// `max_markers` (0 = none) caps the markers of a window and, at an eighth of it, of its

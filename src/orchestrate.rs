@@ -15,7 +15,7 @@ use selphi::io::target_io::{
     read_target_vcf_multi_chr, intersect_variants_for_chr, extract_target_alleles,
 };
 use selphi::genmap;
-use selphi::imputation::windows::compute_imputation_windows;
+use selphi::imputation::windows::compute_imputation_windows_within;
 
 /// Configuration for multi-chr imputation (mirrors relevant CLI args).
 pub struct MultiChrImputeConfig {
@@ -1003,8 +1003,9 @@ pub fn run_multi_chr(
             match_length, fl_fwd, fl_bwd, est_ne, kept_matches);
 
         // Compute imputation windows
-        let windows = compute_imputation_windows(&chip_cm, config.window_cm, config.overlap_cm,
-            selphi::imputation::windows::window_max_markers());
+        let windows = compute_imputation_windows_within(
+            &chip_cm, config.window_cm, config.overlap_cm, selphi::imputation::windows::window_max_markers(),
+            if allele_ls { n_haps * selphi::imputation::windows::ALLELE_LS_MARKER_BYTES } else { 0 });
         // Sites a fill read as reference at low panel frequency: out of the imputation HMM.
         let hmm_skip = selphi::io::variant_only::hmm_skip(&filled_mask, |c| ref_bm_imp.popcount_row(c, n_ref), n_ref);
 

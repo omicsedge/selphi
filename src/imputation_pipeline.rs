@@ -19,7 +19,7 @@ use selphi::genmap;
 use selphi::io::target_io::{read_target_vcf, write_phased_vcf, extract_target_alleles, intersect_variants,
     extract_target_site_confidence, align_confidence_to_chip,
     extract_target_site_confidence_per_sample, align_confidence_to_chip_per_sample};
-use selphi::imputation::windows::compute_imputation_windows;
+use selphi::imputation::windows::compute_imputation_windows_within;
 
 use crate::cli::Args;
 
@@ -1448,8 +1448,9 @@ when it agrees with the re-phased one (--keep-input-phase imputes on the given p
         match_length, fl_fwd, fl_bwd, est_ne, kept_matches, allele_ls);
 
     // 8. Compute imputation windows
-    let windows = compute_imputation_windows(&chip_cm, args.window_cm, args.overlap_cm,
-        selphi::imputation::windows::window_max_markers());
+    let windows = compute_imputation_windows_within(
+        &chip_cm, args.window_cm, args.overlap_cm, selphi::imputation::windows::window_max_markers(),
+        if allele_ls { n_haps * selphi::imputation::windows::ALLELE_LS_MARKER_BYTES } else { 0 });
     // Sites a fill read as reference at low panel frequency: out of the imputation HMM.
     let hmm_skip = selphi::io::variant_only::hmm_skip(&filled_mask, |c| ref_bm_imp.popcount_row(c, n_ref), n_ref);
     selphi_debug!("  Windows: {} ({}cM, {}cM overlap)", windows.len(), args.window_cm, args.overlap_cm);
