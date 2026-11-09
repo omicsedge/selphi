@@ -288,4 +288,20 @@ mod tiling_tests {
             assert_eq!(format!("{a:?}"), format!("{b:?}"));
         }
     }
+
+    #[test]
+    fn weight_budget_cuts_a_window_into_equal_ones_that_fit() {
+        // 2,000 markers over 10 cM, one 80-cM window: with 1 MB a marker the 5,120-MB default
+        // budget fits 5,120 markers (no cut); with 4 MB a marker it fits 1,280: two windows.
+        let cm: Vec<f64> = (0..2000).map(|i| i as f64 * 0.005).collect();
+        let plain = compute_imputation_windows(&cm, 80.0, 2.0, 100_000);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(compute_imputation_windows_within(&cm, 80.0, 2.0, 100_000, 0).len(), 1);
+        assert_eq!(compute_imputation_windows_within(&cm, 80.0, 2.0, 100_000, 1 << 20).len(), 1);
+        let cut = compute_imputation_windows_within(&cm, 80.0, 2.0, 100_000, 4 << 20);
+        assert_eq!(cut.len(), 2);
+        assert!(cut.iter().all(|w| w.chip_end - w.chip_start <= 1280));
+        assert_eq!((cut[0].own_chip_start, cut[1].own_chip_end), (0, 2000));
+        assert_eq!(cut[0].own_chip_end, cut[1].own_chip_start);
+    }
 }

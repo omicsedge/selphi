@@ -2669,6 +2669,29 @@ mod allele_ls_tests {
     }
 
     #[test]
+    fn packed_weights_keep_columns_and_values_within_2_pow_minus_12() {
+        for &v in &[1.0f32, 0.5, 0.000731, 3.7e-6, 1.0 / 1339.0, 2.999, 100.0] {
+            let u = unpack_weight(pack_weight(v));
+            assert!(((u - v) / v).abs() <= 1.0 / 4096.0, "{v} -> {u}");
+        }
+        assert_eq!((pack_weight(0.0), pack_weight(1e-9), unpack_weight(0)), (0, 0, 0.0));
+        let w = CsrWeights { indptr: vec![0, 2, 3], indices: vec![7, 40000, 3], data: vec![0.25, 0.75, 1.0],
+                             n_rows: 2, n_cols: 50000, packed: Vec::new() }.pack();
+        assert!(w.is_packed() && w.indices.is_empty() && w.data.is_empty());
+        let mut row = Vec::new();
+        w.row_entries(0, &mut row);
+        assert_eq!(row, vec![(7, 0.25), (40000, 0.75)]);
+        assert_eq!(w.range_sum(0, 3), 2.0);
+        let mut h = w.clone();
+        h.scale(0.5);
+        assert_eq!(h.range_sum(0, 3), 1.0);
+        // A panel too wide for 16-bit columns stays unpacked.
+        let wide = CsrWeights { indptr: vec![0, 1], indices: vec![1], data: vec![1.0], n_rows: 1, n_cols: PACK_MAX_COLS,
+                                packed: Vec::new() }.pack();
+        assert!(!wide.is_packed());
+    }
+
+    #[test]
     fn mask_from_panel_cols_equals_the_bit_by_bit_mask() {
         // 130 sites x 200 haps (pseudo-random alleles), 150 states in scrambled order, a window
         // starting at row 3: the transposed build must set exactly the bits of the direct one.
