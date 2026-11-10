@@ -495,6 +495,18 @@ pub fn impute_with_members(
 /// Extra members folded into member 0's packed sums directly; more keep the sums exact until the mean.
 const PACKED_FOLDS_MAX: usize = 3;
 
+/// Bytes of the weights a window holds for a run of `n_members` members, given the bytes the
+/// budget's per-haplotype estimate (`ALLELE_LS_MARKER_BYTES`, two members) puts on them: members
+/// widen each target's union of states (about n/2 of two members' on MESA chr20, 9,800 haplotypes:
+/// x1.5 at 3, x1.8 at 4, x2.8 at 6), and beyond `PACKED_FOLDS_MAX` extra members the sums are held
+/// unpacked, twice a packed entry, unless `entry_bytes` already counts unpacked entries. Two
+/// members or fewer: `bytes` unchanged.
+pub fn members_held_bytes(bytes: usize, entry_bytes: usize, n_members: usize) -> usize {
+    let unpack: u128 = if n_members.saturating_sub(1) > PACKED_FOLDS_MAX && entry_bytes < 2 { 2 } else { 1 };
+    let held = (bytes as u128).saturating_mul(unpack * n_members.max(2) as u128) / 2;
+    usize::try_from(held).unwrap_or(usize::MAX)
+}
+
 fn repack(all_weights: &mut [Vec<(usize, CsrWeights)>], f: fn(CsrWeights) -> CsrWeights) {
     use rayon::prelude::*;
     all_weights.par_iter_mut().for_each(|hw| {
@@ -610,6 +622,18 @@ impl<'c> PairFold<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn members_held_bytes_counts_wider_unions_and_unpacked_sums() {
+        assert_eq!(members_held_bytes(544, 1, 1), 544);
+        assert_eq!(members_held_bytes(544, 1, 2), 544);
+        assert_eq!(members_held_bytes(544, 1, 4), 1088);
+        assert_eq!(members_held_bytes(544, 1, 6), 3264);
+        assert_eq!(members_held_bytes(1088, 2, 6), 3264);
+        assert_eq!(members_held_bytes(usize::MAX, 1, 2), usize::MAX);
+        assert_eq!(members_held_bytes(544, 1, usize::MAX), usize::MAX);
+        assert_eq!(members_held_bytes(usize::MAX, 1, usize::MAX), usize::MAX);
+    }
 
     /// Phased target bitmatrix of one sample (2 haps) from per-site (hap0, hap1) alleles.
     fn one_sample(gts: &[(u8, u8)]) -> HaplotypeBitmatrix {
