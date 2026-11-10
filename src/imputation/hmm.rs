@@ -623,6 +623,9 @@ struct LsHmmModel<'a> {
     dense_matches: &'a [Vec<u32>],
     n_matches: &'a [usize],
     n_haps: &'a [f64],
+    // Matched-state mass per site: the seed of a row put on the matched states (equals `n_haps` under the match-set
+    // model; the allele-aware model's `n_haps` is the total state mass, its recombination denominator).
+    n_matched: &'a [f64],
     precomb: &'a [f64],
     n_states: usize,
     p_err: f64,
@@ -1043,7 +1046,7 @@ fn compute_forward(
     init_last_sum: f64,
     prune_threshold: f64,
 ) -> (FwdCheckpoints, Vec<f64>, f64) {
-    let &LsHmmModel { dense_matches, n_matches, n_haps, n_states, group_mass, .. } = model;
+    let &LsHmmModel { dense_matches, n_matches, n_matched, n_states, group_mass, .. } = model;
     let n_rows = stop - start;
     let stride = ((n_rows as f64).sqrt().ceil() as usize).max(1);
     let n_chk = n_rows.div_ceil(stride);
@@ -1061,7 +1064,7 @@ fn compute_forward(
     } else {
         // Uniform over matched haplotypes; a group receives its members' mass.
         let chip_idx = start;
-        let nh = n_haps[chip_idx] as f32;
+        let nh = n_matched[chip_idx] as f32;
         if let Some(gm) = group_mass {
             for &j in &dense_matches[chip_idx] { prev[j as usize] = gm.sizes[j as usize] / nh; }
         } else {
@@ -1115,7 +1118,7 @@ fn compute_forward(
     // Boundary condition for last block
     if is_last {
         let last_chip = (start + n_rows - 1).min(dense_matches.len() - 1);
-        let nh = n_haps[last_chip] as f32;
+        let nh = n_matched[last_chip] as f32;
         let nm = n_matches[last_chip];
         if nm > 0 {
             for j in 0..n_states { prev[j] = 0.0; }
@@ -1393,6 +1396,7 @@ fn streaming_backward_combine(
         dense_matches,
         n_matches,
         n_haps,
+        n_matched,
         precomb: r_precomb,
         n_states,
         p_err,
@@ -1470,7 +1474,7 @@ fn streaming_backward_combine(
                 } else {
                     combine_row(frow, &next_bwd, &mut w_row, inverse_sizes);
                     s_rows.push((row, s_idx.len()));
-                    emit_row(&mut w_row, row, start, dense_matches, n_matches, n_haps,
+                    emit_row(&mut w_row, row, start, dense_matches, n_matches, n_matched,
                              state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat);
                 }
                 continue;
@@ -1541,7 +1545,7 @@ fn streaming_backward_combine(
             } else {
                 combine_row(frow, &cur_bwd, &mut w_row, inverse_sizes);
                 s_rows.push((row, s_idx.len()));
-                emit_row(&mut w_row, row, start, dense_matches, n_matches, n_haps,
+                emit_row(&mut w_row, row, start, dense_matches, n_matches, n_matched,
                          state_to_hap, group_members, mass_sizes, csr_threshold, &mut s_idx, &mut s_dat);
             }
 
@@ -1584,7 +1588,7 @@ fn streaming_backward_combine(
     let mut h_rows: Vec<(usize, usize)> = Vec::with_capacity(held.len());
     for (row, raw) in held.iter_mut() {
         h_rows.push((*row, h_idx.len()));
-        emit_row(raw, *row, start, dense_matches, n_matches, n_haps,
+        emit_row(raw, *row, start, dense_matches, n_matches, n_matched,
                  state_to_hap, group_members, mass_sizes, csr_threshold, &mut h_idx, &mut h_dat);
     }
 
@@ -1737,6 +1741,7 @@ pub struct HmmPrep<'a> {
     group_sizes_f32: Option<Vec<f32>>,
     group_mass_f32: Option<(Vec<f32>, Vec<f32>)>,
     n_haps_per_site: Vec<f64>,
+    matched_mass_per_site: Vec<f64>,
     f_precomb: Vec<f64>,
     r_precomb: Vec<f64>,
     threshold_states: f64,
@@ -1889,18 +1894,17 @@ pub fn prepare_weights<'a>(
         None => n_states as f64,
     };
     let use_total = allele_ls || crate::config::is_one("SELPHI_HMM_TOTAL_RECOMB_DENOM");
-    let mut n_haps_per_site = vec![1.0f64; distances_cm.len()];
+    let mut matched_mass_per_site = vec![1.0f64; distances_cm.len()];
     for (site, dm) in dense_matches.iter().enumerate() {
-        let nh = if use_total {
-            total_state_mass
-        } else if let Some(ref gs) = group_sizes_f64 {
+        let nh = if let Some(ref gs) = group_sizes_f64 {
             dm.iter().map(|&j| gs[j as usize]).sum::<f64>()
         } else {
             dm.len() as f64
         };
         // Ensure nh >= 1 to avoid division by zero in recombination formula
-        n_haps_per_site[site] = nh.max(1.0);
+        matched_mass_per_site[site] = nh.max(1.0);
     }
+    let n_haps_per_site = if use_total { vec![total_state_mass.max(1.0); distances_cm.len()] } else { matched_mass_per_site.clone() };
 
     // 7. Compute recombination probabilities
     // n_hid = total reference haplotypes (NOT reduced n_states)
@@ -1921,7 +1925,7 @@ pub fn prepare_weights<'a>(
     HmmPrep {
         group_sizes_f32: group_sizes_f64.as_ref().map(|gs| gs.iter().map(|&g| g as f32).collect()),
         dense_matches, n_matches, state_to_hap, n_states, dedup_result, group_sizes_f64, group_mass_f32,
-        n_haps_per_site, f_precomb, r_precomb, threshold_states, csr_threshold, prune_threshold,
+        n_haps_per_site, matched_mass_per_site, f_precomb, r_precomb, threshold_states, csr_threshold, prune_threshold,
         exact_dedup, use_hap_prior, hap_prior, perr, n_ref_haps, n_sites: distances_cm.len(), log_n, debug_line,
     }
 }
@@ -1946,7 +1950,7 @@ pub fn run_weights(
     let HmmPrep {
         ref dense_matches, ref n_matches, ref state_to_hap, n_states, ref dedup_result, ref group_sizes_f64,
         ref group_sizes_f32,
-        ref group_mass_f32, ref n_haps_per_site, ref f_precomb, ref r_precomb, threshold_states, csr_threshold,
+        ref group_mass_f32, ref n_haps_per_site, ref matched_mass_per_site, ref f_precomb, ref r_precomb, threshold_states, csr_threshold,
         prune_threshold, exact_dedup, use_hap_prior, hap_prior, perr, n_ref_haps, n_sites, log_n, ref debug_line,
     } = *prep;
     let p_err = perr.resolve(min_perr);
@@ -2053,6 +2057,7 @@ pub fn run_weights(
             dense_matches: &dense_matches,
             n_matches: &n_matches,
             n_haps: &n_haps_per_site,
+            n_matched: &matched_mass_per_site,
             precomb: &f_precomb,
             n_states,
             p_err,
@@ -2081,7 +2086,7 @@ pub fn run_weights(
             let check_rows = [0usize, 1, 2, 5, 10, 50, 100, 500, 1000, 5000, 9000];
             // Iterate over blocks, dump rows matching check_rows (global indexing)
             let dump_model = LsHmmModel {
-                dense_matches: &dense_matches, n_matches: &n_matches, n_haps: &n_haps_per_site,
+                dense_matches: &dense_matches, n_matches: &n_matches, n_haps: &n_haps_per_site, n_matched: &matched_mass_per_site,
                 precomb: &f_precomb, n_states, p_err, group_sizes: group_sizes_f32.as_deref(), group_mass,
                 emission_ratios: dense_emission_ratios.as_deref(), site_perr: site_perr.as_deref(), mismatch: mismatch.as_ref(),
             };
@@ -2126,6 +2131,7 @@ pub fn run_weights(
             dense_matches: &dense_matches,
             n_matches: &n_matches,
             n_haps: &n_haps_per_site,
+            n_matched: &matched_mass_per_site,
             precomb: &f_precomb,
             n_states,
             p_err,
@@ -2138,6 +2144,7 @@ pub fn run_weights(
             dense_matches: &dense_matches,
             n_matches: &n_matches,
             n_haps: &n_haps_per_site,
+            n_matched: &matched_mass_per_site,
             precomb: &r_precomb,
             n_states,
             p_err,
@@ -2501,7 +2508,7 @@ mod tests {
         let inverse_sizes: Vec<f32> = group_sizes_f32.iter().map(|&size| 1.0f32 / size).collect();
         let n_states = if grouped { sizes.len() } else { n_haps };
         let model = LsHmmModel {
-            dense_matches: &matches, n_matches: &n_matches, n_haps: &n_haps_per_site,
+            dense_matches: &matches, n_matches: &n_matches, n_haps: &n_haps_per_site, n_matched: &n_haps_per_site,
             precomb: &precomb, n_states, p_err,
             group_sizes: if grouped { Some(&group_sizes_f32) } else { None },
             group_mass: grouped.then_some(GroupMass { sizes: &group_sizes_f32, inverse_sizes: &inverse_sizes }),
@@ -2686,6 +2693,25 @@ mod tests {
 #[cfg(test)]
 mod allele_ls_tests {
     use super::*;
+
+    /// Under the total-mass recombination denominator the first forward row is seeded at the matched states with the
+    /// matched mass, so it sums to 1 like the carried `last_sum` (dividing by the total mass gave 2/4 here).
+    #[test]
+    fn first_forward_row_sums_to_one_with_total_denominator() {
+        let matches = vec![vec![0u32, 1], vec![1, 2, 3], vec![0, 1, 2, 3]];
+        let n_matches: Vec<usize> = matches.iter().map(Vec::len).collect();
+        let total = vec![4.0f64; 3];
+        let matched: Vec<f64> = n_matches.iter().map(|&m| m as f64).collect();
+        let precomb = vec![0.01f64 / 4.0; 3];
+        let model = LsHmmModel {
+            dense_matches: &matches, n_matches: &n_matches, n_haps: &total, n_matched: &matched,
+            precomb: &precomb, n_states: 4, p_err: 0.5, group_sizes: None, group_mass: None,
+            emission_ratios: None, site_perr: None, mismatch: None,
+        };
+        let (cp, _, _) = compute_forward(&model, 0, 3, false, None, 1.0, 0.0);
+        let row0: f32 = cp.rows[..4].iter().sum();
+        assert!((row0 - 1.0).abs() < 1e-6, "first row sums to {row0}");
+    }
 
     /// The mask flags exactly the states whose representative carries the other allele (called-site
     /// rows included), multiplies them by ALLELE_LS_MISMATCH, and a zero-confidence site is neutral.
