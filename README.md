@@ -92,6 +92,7 @@ selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map chr22.map --out i
 ```
 
 - Input is VCF or BCF, phased or unphased. Selphi phases the samples, then imputes every panel site.
+- Bases are matched in any case (`C>CaAT` is the panel site `C>CAAT`) and written upper case.
 - Multi-allelic records are split. A substitution with REF and ALT swapped against the panel is matched (not a
   palindromic A/T or C/G SNP); `--allele-match full` also matches strand flips.
 - Records the panel does not have are written back with their genotype calls (`--drop-unmatched` leaves them out).

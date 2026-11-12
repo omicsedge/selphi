@@ -20,7 +20,7 @@
 //! dosage per row, so they carry the biallelic records and skip the others;
 //! the run log says how many.
 
-use crate::io::target_io::is_ref_symbolic;
+use crate::io::target_io::{allele_upper, is_ref_symbolic};
 use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
@@ -283,10 +283,11 @@ fn scan<R: noodles_vcf::variant::Record>(
     let Some(start) = rec.variant_start().transpose()? else { return Ok(()) };
     let pos = usize::from(start) as i64;
     let ref_allele: String = rec.reference_bases().iter()
-        .map(|b| b.map(char::from)).collect::<io::Result<_>>()?;
+        .map(|b| b.map(char::from)).collect::<io::Result<String>>()?;
+    let ref_allele = allele_upper(&ref_allele);
     let alt_bases = rec.alternate_bases();
     let n_alts = alt_bases.len();
-    let alts: Vec<String> = alt_bases.iter().map(|a| a.map(|a| a.to_string())).collect::<io::Result<_>>()?;
+    let alts: Vec<String> = alt_bases.iter().map(|a| a.map(allele_upper)).collect::<io::Result<_>>()?;
     let first_alt = alts.first().cloned().unwrap_or_else(|| ".".to_string());
     let mut key = (pos, ref_allele, first_alt);
     let first_matched = matched.contains(&key);
@@ -364,9 +365,9 @@ fn pass_record(rec: &noodles_vcf::variant::RecordBuf, pos: i64) -> PassRecord {
     use noodles_vcf::variant::record::samples::series::value::genotype::Phasing;
     use noodles_vcf::variant::record_buf::samples::sample::Value;
 
-    let ref_allele = rec.reference_bases().to_string();
+    let ref_allele = allele_upper(rec.reference_bases());
     let alts: Vec<String> = rec.alternate_bases().as_ref().iter()
-        .filter(|a| a.as_str() != "." && !a.is_empty()).cloned().collect();
+        .filter(|a| a.as_str() != "." && !a.is_empty()).map(|a| allele_upper(a)).collect();
     let id = rec.ids().as_ref().iter().next().cloned().unwrap_or_else(|| ".".to_string());
     let samples = rec.samples();
     let n = samples.values().count();
@@ -469,6 +470,24 @@ mod tests {
         p.append_vcf(1, 1..3, &mut buf);
         assert_eq!(String::from_utf8(buf).unwrap(),
             "22\t5\t.\tA\tC,T\t.\t.\t.\tGT\t0|2\t./1\t1\n22\t6\t.\tA\t.\t.\t.\t.\tGT\t./.\t0\n");
+    }
+
+    #[test]
+    fn lowercase_bases_are_the_panel_site_and_written_upper_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.vcf");
+        std::fs::write(&path, "##fileformat=VCFv4.2\n##contig=<ID=22>\n\
+            ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts\n\
+            22\t100\t.\tC\tCaAT\t.\t.\t.\tGT\t0/1\n\
+            22\t200\t.\tCctgGTG\tC\t.\t.\t.\tGT\t0/1\n\
+            22\t300\t.\tA\tc,G\t.\t.\t.\tGT\t1/2\n\
+            22\t400\t.\ttA\tT\t.\t.\t.\tGT\t0/1\n").unwrap();
+        let matched: HashSet<SiteKey> = [(100, "C", "CAAT"), (300, "A", "G"), (400, "TA", "T")].iter()
+            .map(|&(p, r, a)| (p, r.to_string(), a.to_string())).collect();
+        let out = collect(path.to_str().unwrap(), "22", &matched, false).unwrap();
+        let got: Vec<_> = out.iter().map(|r| (r.pos, r.ref_allele.as_str(), r.alts.join(","))).collect();
+        assert_eq!(got, vec![(200, "CCTGGTG", "C".to_string()), (300, "A", "C".to_string())]);
     }
 
     #[test]

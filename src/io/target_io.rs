@@ -515,6 +515,17 @@ pub fn is_ref_symbolic(alt: &str) -> bool {
     matches!(alt, "<NON_REF>" | "<*>" | "<X>")
 }
 
+/// An allele as matched against the panel and written: VCF bases are case-insensitive and
+/// the panel's are upper case, so `C>CaAT` is the panel's `C>CAAT`. Symbolic (`<DEL>`) and
+/// breakend (`]chr1:5]A`) alleles are kept as given.
+pub fn allele_upper(a: &str) -> String {
+    if a.bytes().any(|b| b.is_ascii_lowercase()) && a.bytes().all(|b| b.is_ascii_alphabetic() || b == b'*') {
+        a.to_ascii_uppercase()
+    } else {
+        a.to_string()
+    }
+}
+
 fn push_target_record(
     chrom: &str, pos: i64, ref_allele: &str, alts: &[&str], mut raw: Vec<[u8; 2]>,
     hash_alleles: bool, unphased: &[u32], markers: &mut Vec<TargetMarker>, genotypes: &mut Vec<Vec<[u8; 2]>>,
@@ -529,7 +540,10 @@ fn push_target_record(
             }
         }
     }
+    let ref_upper = allele_upper(ref_allele);
+    let ref_allele = ref_upper.as_str();
     let mut push = |alt: &str, gts: Vec<[u8; 2]>| {
+        let alt = &allele_upper(alt);
         let unphased_het = unphased.iter().any(|&s| {
             let [a, b] = gts[s as usize];
             a != b && a != GT_MISSING && b != GT_MISSING
@@ -2261,6 +2275,17 @@ mod allele_match_tests {
             assert_eq!(n_target_markers(alts.into_iter()), n);
             if n == 1 { assert_eq!(g[0][0], [0, GT_MISSING], "a call of <NON_REF> is unknown, not REF"); }
         }
+    }
+
+    #[test]
+    fn lowercase_bases_match_the_panel_spelling() {
+        let (mut m, mut g) = (Vec::new(), Vec::new());
+        push_target_record("22", 100, "CctgGTG", &["C", "tA"], vec![[0, 1]], true, &[], &mut m, &mut g);
+        assert_eq!(m.iter().map(|x| (x.ref_allele.as_str(), x.alt_allele.as_str())).collect::<Vec<_>>(),
+                   vec![("CCTGGTG", "C"), ("CCTGGTG", "TA")]);
+        assert_eq!((m[0].ref_hash.as_str(), m[1].alt_hash.as_str()),
+                   (crate::srp::blake2b_hex("CCTGGTG").as_str(), crate::srp::blake2b_hex("TA").as_str()));
+        for a in ["]chr1:5]A", "<del>", "ACGT", "*"] { assert_eq!(allele_upper(a), a); }
     }
 
     #[test]
