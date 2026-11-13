@@ -38,33 +38,43 @@ def constants(script: str) -> dict:
     return names
 
 
-def stills(svg_name: str, script: str) -> list[tuple[str, str, str]]:
-    """One PNG per step, taken at 80% of the step, once its motion has settled: (file, step name, caption)."""
+def stills(name: str, script: str) -> list[tuple[str, str, str]]:
+    """One PNG per step and theme, taken at 80% of the step, once its motion has settled.
+
+    Returns (file stem, step name, caption); the files are <stem>_light.png and <stem>_dark.png, on a transparent page
+    so the rounded corners take GitHub's own background.
+    """
     c = constants(script)
-    svg = open(os.path.join(ROOT, "img", svg_name)).read()
-    width, height = (int(v) for v in re.search(r'viewBox="0 0 (\d+) (\d+)"', svg).groups())
-    base = svg_name.removesuffix("_light.svg")
     out = []
     with tempfile.TemporaryDirectory() as tmp:
-        for i, ((step, start, end), cap) in enumerate(zip(c["STEPS"], c["CAPS"]), 1):
-            t = (start + 0.8 * (end - start)) * c["DUR"]
-            page = os.path.join(tmp, "frame.html")
-            with open(page, "w") as f:
-                f.write(f"<!doctype html><html><body style='margin:0'>{svg}<script>"
-                        f"const s=document.querySelector('svg');s.pauseAnimations();s.setCurrentTime({t:.3f});"
-                        "</script></body></html>")
-            png = f"{base}_{i}.png"
-            subprocess.run([chrome(), "--headless", "--no-sandbox", "--hide-scrollbars", "--force-device-scale-factor=1.5",
-                            f"--window-size={width},{height}", f"--screenshot={os.path.join(OUT_DIR, png)}",
-                            f"file://{page}"], check=True, capture_output=True)
-            out.append((png, step, cap))
+        for theme in ("light", "dark"):
+            svg = open(os.path.join(ROOT, "img", f"{name}_{theme}.svg")).read()
+            width, height = (int(v) for v in re.search(r'viewBox="0 0 (\d+) (\d+)"', svg).groups())
+            for i, ((step, start, end), cap) in enumerate(zip(c["STEPS"], c["CAPS"]), 1):
+                t = (start + 0.8 * (end - start)) * c["DUR"]
+                page = os.path.join(tmp, "frame.html")
+                with open(page, "w") as f:
+                    f.write(f"<!doctype html><html><body style='margin:0;background:transparent'>{svg}<script>"
+                            f"const s=document.querySelector('svg');s.pauseAnimations();s.setCurrentTime({t:.3f});"
+                            "</script></body></html>")
+                stem = f"{name}_{i}"
+                subprocess.run([chrome(), "--headless", "--no-sandbox", "--hide-scrollbars",
+                                "--default-background-color=00000000", "--force-device-scale-factor=1.5",
+                                f"--window-size={width},{height}",
+                                f"--screenshot={os.path.join(OUT_DIR, f'{stem}_{theme}.png')}",
+                                f"file://{page}"], check=True, capture_output=True)
+                if theme == "light":
+                    out.append((stem, step, cap))
     return out
 
 
 def still_block(frames: list[tuple[str, str, str]]) -> str:
     parts = []
-    for i, (png, step, cap) in enumerate(frames, 1):
-        parts.append(f"**{i}. {step}.** {cap}\n\n<img src=\"static/{png}\" alt=\"{step}\" width=\"900\"/>")
+    for i, (stem, step, cap) in enumerate(frames, 1):
+        parts.append(f"**{i}. {step}.** {cap}\n\n<picture>\n"
+                     f'  <source media="(prefers-color-scheme: dark)" srcset="static/{stem}_dark.png"/>\n'
+                     f'  <source media="(prefers-color-scheme: light)" srcset="static/{stem}_light.png"/>\n'
+                     f'  <img src="static/{stem}_light.png" alt="{step}" width="900"/>\n</picture>')
     return "\n\n".join(parts)
 
 
@@ -87,7 +97,7 @@ def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
     md = open(os.path.join(ROOT, "README.md")).read()
     for name, script in (("how", "readme_explainer.py"), ("lowcov", "readme_lowcov.py")):
-        block = still_block(stills(f"{name}_light.svg", script))
+        block = still_block(stills(name, script))
         md, n = picture(name).subn(lambda _: block, md)
         assert n == 1, f"{name}: {n} animations found in README.md"
     md, n = picture("demo").subn(lambda _: demo_block(), md)

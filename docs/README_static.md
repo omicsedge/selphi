@@ -22,27 +22,51 @@ Rust and needs no other tools at run time. It takes three kinds of input:
 
 **1. Reference panel.** The panel file (SRP) holds compressed sparse tiles; in memory each allele is one bit, shared by both steps.
 
-<img src="static/how_1.png" alt="Reference panel" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/how_1_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/how_1_light.png"/>
+  <img src="static/how_1_light.png" alt="Reference panel" width="900"/>
+</picture>
 
 **2. Phasing.** Phasing: heterozygotes form segments of up to three (up to 2³ configurations); MCMC samples both paths against panel neighbours.
 
-<img src="static/how_2.png" alt="Phasing" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/how_2_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/how_2_light.png"/>
+  <img src="static/how_2_light.png" alt="Phasing" width="900"/>
+</picture>
 
 **3. PBWT selection.** PBWT: with the panel sorted by reversed prefixes, the haplotypes next to the target's place match it longest: the candidates.
 
-<img src="static/how_3.png" alt="PBWT selection" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/how_3_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/how_3_light.png"/>
+  <img src="static/how_3_light.png" alt="PBWT selection" width="900"/>
+</picture>
 
 **4. Li-Stephens HMM.** A Li-Stephens HMM runs forward, then backward, over the typed sites: each candidate gets a copying weight.
 
-<img src="static/how_4.png" alt="Li-Stephens HMM" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/how_4_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/how_4_light.png"/>
+  <img src="static/how_4_light.png" alt="Li-Stephens HMM" width="900"/>
+</picture>
 
 **5. Interpolation.** Untyped sites take the weights interpolated in cM from the typed sites around them; the allele probability is the weight on carriers.
 
-<img src="static/how_5.png" alt="Interpolation" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/how_5_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/how_5_light.png"/>
+  <img src="static/how_5_light.png" alt="Interpolation" width="900"/>
+</picture>
 
 **6. Dosages.** DS = AP1 + AP2 per site, averaged over the phase ensemble, written with the most likely phased genotype.
 
-<img src="static/how_6.png" alt="Dosages" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/how_6_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/how_6_light.png"/>
+  <img src="static/how_6_light.png" alt="Dosages" width="900"/>
+</picture>
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -289,19 +313,35 @@ does. Each output genotype is the most probable one.
 
 **1. Reads.** Low-coverage reads (about 1.5x here): most sites are seen by one or two reads, some by none. A read pair comes from one haplotype.
 
-<img src="static/lowcov_1.png" alt="Reads" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/lowcov_1_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/lowcov_1_light.png"/>
+  <img src="static/lowcov_1_light.png" alt="Reads" width="900"/>
+</picture>
 
 **2. Likelihoods.** Each site gets genotype likelihoods from its reads: sharp where several reads agree, flat where there are none.
 
-<img src="static/lowcov_2.png" alt="Likelihoods" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/lowcov_2_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/lowcov_2_light.png"/>
+  <img src="static/lowcov_2_light.png" alt="Likelihoods" width="900"/>
+</picture>
 
 **3. Panel model.** The panel supplies what the reads lack: the sample's two haplotypes are modelled as copies of panel haplotypes.
 
-<img src="static/lowcov_3.png" alt="Panel model" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/lowcov_3_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/lowcov_3_light.png"/>
+  <img src="static/lowcov_3_light.png" alt="Panel model" width="900"/>
+</picture>
 
 **4. Genotypes.** Likelihood × panel model at every site: where the reads are sharp they carry the call; elsewhere the panel does.
 
-<img src="static/lowcov_4.png" alt="Genotypes" width="900"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="static/lowcov_4_dark.png"/>
+  <source media="(prefers-color-scheme: light)" srcset="static/lowcov_4_light.png"/>
+  <img src="static/lowcov_4_light.png" alt="Genotypes" width="900"/>
+</picture>
 
 ```bash
 selphi --bam sample.cram --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map --out imputed --threads 16
