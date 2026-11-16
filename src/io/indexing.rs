@@ -147,7 +147,8 @@ fn scan_bcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
 
     let header = String::from_utf8_lossy(&header_bytes);
     let meta = parse_header(&header);
-    // GT's dictionary index (its IDX=), to tell a GT vector from another FORMAT field.
+    // GT's dictionary index (its IDX=), to tell a GT vector from another FORMAT field; without
+    // IDX= the first FORMAT field is taken as GT, as the VCF spec places it.
     let gt_idx: Option<u32> = header.lines().find(|l| l.starts_with("##FORMAT=<ID=GT,"))
         .and_then(|l| l.split("IDX=").nth(1)).and_then(|s| s.split([',', '>']).next())
         .and_then(|s| s.parse().ok());
@@ -189,7 +190,7 @@ fn scan_bcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
             let t = 1 + key_w;
             let key = (key_w > 0 && indiv.len() > t)
                 .then(|| indiv[1..t].iter().rev().fold(0u32, |k, &b| (k << 8) | b as u32));
-            if key.is_some() && key == gt_idx && indiv.len() > t + 2 && indiv[t] & 0x0f == 1 && indiv[t] >> 4 >= 2 {
+            if key.is_some() && gt_idx.map_or(true, |g| key == Some(g)) && indiv.len() > t + 2 && indiv[t] & 0x0f == 1 && indiv[t] >> 4 >= 2 {
                 let b1 = indiv[t + 2];
                 is_phased = b1 != 0x81 && b1 & 1 == 1;
             }
