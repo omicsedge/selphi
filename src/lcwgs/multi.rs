@@ -38,8 +38,9 @@ pub fn srp_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         .filter(|p| crate::srp::is_panel_path(&p.to_string_lossy())).collect();
     v.sort();
     if v.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no .srp2 file in {}", dir.display())));
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no .srp2 or .srp file in {}", dir.display())));
     }
+    crate::srp::refuse_both_panel_names(&v)?;
     Ok(v)
 }
 

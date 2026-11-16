@@ -1002,10 +1002,11 @@ pub fn merge_srps_from_dir(
 
     if srp_files.is_empty() {
         return Err(io::Error::new(io::ErrorKind::NotFound,
-            format!("No .srp2 files found in {}", source_dir.display())));
+            format!("No .srp2 or .srp files found in {}", source_dir.display())));
     }
 
     srp_files.sort();
+    super::refuse_both_panel_names(&srp_files)?;
 
     // Validate each file can be opened
     let mut valid: Vec<std::path::PathBuf> = Vec::new();
