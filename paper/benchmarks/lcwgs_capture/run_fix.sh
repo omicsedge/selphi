@@ -46,16 +46,16 @@ else
 fi
 
 say "F4: filtered panel (alleles <=255bp) + prep SRP selphi2"
-if [ ! -f s2_chr22.srp ]; then
+if [ ! -f s2_chr22.srp2 ]; then
   bcftools view -e 'STRLEN(REF)>255 || STRLEN(ALT)>255' "$BCF22" -Ob -o panel22_filt.bcf
   bcftools index -f panel22_filt.bcf
-  "$S2BIN" --prepare-reference-from panel22_filt.bcf --out s2_chr22.srp --threads 16 > selphi2_prep.log 2>&1 \
+  "$S2BIN" --prepare-reference-from panel22_filt.bcf --out s2_chr22.srp2 --threads 16 > selphi2_prep.log 2>&1 \
     || { say "F4 prep FAILED"; tail -5 selphi2_prep.log; }
 fi
 
 say "F5: selphi2_cluster (hard calls)"
-if [ -f s2_chr22.srp ]; then
-  if "$S2BIN" --refpanel s2_chr22.srp --input target_chr22_nochr.vcf.gz \
+if [ -f s2_chr22.srp2 ]; then
+  if "$S2BIN" --refpanel s2_chr22.srp2 --input target_chr22_nochr.vcf.gz \
       --map "$MAP22" --out imputed_selphi2_chr22 --threads 16 > selphi2_run.log 2>&1; then
     say "F5: OK"
   else
@@ -75,8 +75,8 @@ if [ "$NGL" -lt 100000 ]; then
   bcftools index -f -t gl_chr22_nochr.vcf.gz
   say "F6: regenerated with $(bcftools view -H gl_chr22_nochr.vcf.gz | wc -l) records"
 fi
-if [ -f s2_chr22.srp ]; then
-  if "$S2BIN" --lcwgs --refpanel s2_chr22.srp --input gl_chr22_nochr.vcf.gz \
+if [ -f s2_chr22.srp2 ]; then
+  if "$S2BIN" --lcwgs --refpanel s2_chr22.srp2 --input gl_chr22_nochr.vcf.gz \
       --map "$MAP22" --out imputed_lcwgs_chr22 --threads 16 > selphi2_lcwgs.log 2>&1; then
     say "F6: OK"
   else

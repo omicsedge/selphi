@@ -12,7 +12,7 @@ say(){ echo "[$(date -Is)] $*"; }
 mkdir -p repro
 for S in NA24143 NA24149 NA24385 NA24631 NA24694 NA24695; do
   say "$S: re-run lcWGS (HEAD) from the SAME ${S}_gl22.vcf.gz"
-  $S2 --lcwgs --refpanel s2_chr22_noleak.srp --input ${S}_gl22.vcf.gz --map "$MAP22" \
+  $S2 --lcwgs --refpanel s2_chr22_noleak.srp2 --input ${S}_gl22.vcf.gz --map "$MAP22" \
       --out repro/${S}_re_lcwgs --threads 16 > repro/${S}_re.log 2>&1 || { say "$S FAILED"; continue; }
   bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n' repro/${S}_re_lcwgs.vcf.gz 2>/dev/null \
     | awk 'length($3)==1 && length($4)==1 {c=$1; sub(/^chr/,"",c); print "chr"c"\t"$2"\t"$3"\t"$4"\t"$5}' > repro/${S}_re.tsv

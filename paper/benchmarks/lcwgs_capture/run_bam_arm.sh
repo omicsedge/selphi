@@ -14,10 +14,10 @@ declare -A BED22=( [NA24385]=$GL/HG002_hiconf_chr22.bed [NA24149]=$GL/HG003_hico
                    [NA24631]=$E3/HG005_hiconf_chr22.bed [NA24694]=$E3/HG006_hiconf_chr22.bed [NA24695]=$E3/HG007_hiconf_chr22.bed )
 for S in NA24143 NA24149 NA24385 NA24631 NA24694 NA24695; do
   if [ "$N" = 22 ]; then
-    SRP=s2_chr22_noleak.srp; BAM=${S}_chr22.bam; [ -s $BAM ] || { samtools view -b -@ 8 ${S}.bam chr22 -o $BAM && samtools index $BAM; }
+    SRP=s2_chr22_noleak.srp2; BAM=${S}_chr22.bam; [ -s $BAM ] || { samtools view -b -@ 8 ${S}.bam chr22 -o $BAM && samtools index $BAM; }
     OUT=native22_${S}; SITES=g2_${S}_sites.tsv; TRUTH=${S}_truth22.tsv; BED=${BED22[$S]}; EXCL=typed_chr22.txt; AF=af22.tsv; CONC=${S}_conc_selphi_native.json
   else
-    D=chr$N; SRP=$D/s2.srp; BAM=$D/${S}.bam; OUT=$D/${S}_selphi_native; SITES=$D/sites_${S}.tsv; TRUTH=$D/${S}_truth.tsv; BED=$D/${S}_hiconf.bed; EXCL=$D/typed.txt; AF=$D/af.tsv; CONC=$D/${S}_conc_selphi_native.json
+    D=chr$N; SRP=$D/s2.srp2; BAM=$D/${S}.bam; OUT=$D/${S}_selphi_native; SITES=$D/sites_${S}.tsv; TRUTH=$D/${S}_truth.tsv; BED=$D/${S}_hiconf.bed; EXCL=$D/typed.txt; AF=$D/af.tsv; CONC=$D/${S}_conc_selphi_native.json
   fi
   [ -s "$SITES" ] || { say "$S: site list missing ($SITES) — GLIMPSE2 not finished yet, skipping"; continue; }
   if [ ! -s ${OUT}.vcf.gz ]; then

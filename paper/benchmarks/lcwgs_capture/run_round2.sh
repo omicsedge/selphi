@@ -27,18 +27,18 @@ fi
 say "R1: AF calculated for $(wc -l < af22.tsv) sites"
 
 say "R2: prepare leak-free SRP for Selphi 2"
-if [ ! -f s2_chr22_noleak.srp ]; then
-  "$S2BIN" --prepare-reference-from panel22_noleak.bcf --out s2_chr22_noleak.srp --threads 16 > selphi2_prep_nl.log 2>&1 \
+if [ ! -f s2_chr22_noleak.srp2 ]; then
+  "$S2BIN" --prepare-reference-from panel22_noleak.bcf --out s2_chr22_noleak.srp2 --threads 16 > selphi2_prep_nl.log 2>&1 \
     || { say "R2 FAILED"; tail -5 selphi2_prep_nl.log; }
 fi
 
 say "R3: selphi2 hard-call (leak-free)"
-"$S2BIN" --refpanel s2_chr22_noleak.srp --input target_chr22_nochr.vcf.gz \
+"$S2BIN" --refpanel s2_chr22_noleak.srp2 --input target_chr22_nochr.vcf.gz \
     --map "$MAP22" --out imputed_s2hard_nl_chr22 --threads 16 > selphi2_run_nl.log 2>&1 \
   && say "R3: OK" || { say "R3: FAILED"; tail -5 selphi2_run_nl.log; }
 
 say "R4: selphi2 --lcwgs (leak-free)"
-"$S2BIN" --lcwgs --refpanel s2_chr22_noleak.srp --input gl_chr22_nochr.vcf.gz \
+"$S2BIN" --lcwgs --refpanel s2_chr22_noleak.srp2 --input gl_chr22_nochr.vcf.gz \
     --map "$MAP22" --out imputed_lcwgsnl_chr22 --threads 16 > selphi2_lcwgs_nl.log 2>&1 \
   && say "R4: OK" || { say "R4: FAILED"; tail -5 selphi2_lcwgs_nl.log; }
 
