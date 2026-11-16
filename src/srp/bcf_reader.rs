@@ -29,7 +29,7 @@ pub struct BcfHeader {
 /// The header of a BCF whose genotypes are read: without a GT line the key would default to
 /// FORMAT id 0 (often PL or DP), read as genotypes. Readers of other fields (a DS-only file
 /// scored by the evaluator) use [`read_header_only`].
-fn read_genotype_header(path: &Path) -> io::Result<BcfHeader> {
+pub(crate) fn read_genotype_header(path: &Path) -> io::Result<BcfHeader> {
     let header = read_header_only(path)?;
     if header.n_samples > 0 && !header.has_gt {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
