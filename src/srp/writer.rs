@@ -544,6 +544,7 @@ pub fn build_srp_unified(
     let mut active: std::collections::BTreeMap<usize, Vec<Vec<u16>>> = std::collections::BTreeMap::new();
     let mut var_offset = 0usize;
     let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
+    let mut next_stripe = 0usize;
     let mut stripes_flushed = 0usize;
 
     for (ci, cf) in chunk_files.iter().enumerate() {
@@ -564,13 +565,11 @@ pub fn build_srp_unified(
             last_stripe + 1 // flush everything
         };
 
-        let to_flush: Vec<usize> = active.keys().copied()
-            .take_while(|&s| s < next_first_stripe).collect();
-        for s in to_flush {
-            if let Some(cols) = active.remove(&s) {
-                pending_stripes.push((s, cols));
-            }
+        // Every stripe gets its tiles, one with no ALT allele too: the tile index has no gaps.
+        for s in next_stripe..next_first_stripe.min(n_stripes) {
+            pending_stripes.push((s, active.remove(&s).unwrap_or_else(|| vec![Vec::new(); n_haps])));
         }
+        next_stripe = next_stripe.max(next_first_stripe);
         if pending_stripes.len() >= batch_size {
             let flushed_now = pending_stripes.len();
             flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;

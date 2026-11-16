@@ -229,6 +229,7 @@ pub fn build_multi_chr_srp(
         let mut active: std::collections::BTreeMap<usize, Vec<Vec<u16>>> = std::collections::BTreeMap::new();
         let mut var_offset = 0usize;
         let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
+        let mut next_stripe = 0usize;
 
         for (ci, cf) in chunk_files.iter().enumerate() {
             let compressed = std::fs::read(cf)?;
@@ -245,13 +246,11 @@ pub fn build_multi_chr_srp(
                 n_tile_rows // flush everything
             };
 
-            let to_flush: Vec<usize> = active.keys().copied()
-                .take_while(|&s| s < next_first_stripe).collect();
-            for s in to_flush {
-                if let Some(cols) = active.remove(&s) {
-                    pending_stripes.push((s, cols));
-                }
+            // Every stripe gets its tiles, one with no ALT allele too: the tile index has no gaps.
+            for s in next_stripe..next_first_stripe {
+                pending_stripes.push((s, active.remove(&s).unwrap_or_else(|| vec![Vec::new(); n_haps])));
             }
+            next_stripe = next_stripe.max(next_first_stripe);
             if pending_stripes.len() >= batch_size {
                 flush_tiles(&mut w, &mut pending_stripes, n_haps, n_variants,
                     n_tile_cols, &mut tile_entries, &mut write_pos)?;
