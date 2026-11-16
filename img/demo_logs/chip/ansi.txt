@@ -1,4 +1,4 @@
-Script started on 2026-11-10 16:21:34+00:00 [COMMAND="selphi --refpanel chr22.srp --input chip.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp --threads 16 " <not executed on terminal>]
+Script started on 2026-11-10 16:21:34+00:00 [COMMAND="selphi --refpanel chr22.srp2 --input chip.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz --exclude-panel-monomorphic chr22.srp2 --threads 16 " <not executed on terminal>]
 [1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
   auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 1602000 GT entries) density=262/Mb (thr 1000) settled PL 0/0 (variant records 0/0, blocks 0) [2m[0.0s | 108 MB][0m
   auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) [32m→ genotype engine (no refine)[0m [2m[0.0s | 108 MB][0m
@@ -10,7 +10,7 @@ Script started on 2026-11-10 16:21:34+00:00 [COMMAND="selphi --refpanel chr22.sr
       [2mv2.0.0[0m 🦀 [32mSelfDecode™[0m
 
   input:    chip.vcf.gz
-  refpanel: chr22.srp
+  refpanel: chr22.srp2
   map:      chr22.map
   output:   imputed
   threads:  16
@@ -45,7 +45,7 @@ Script started on 2026-11-10 16:21:34+00:00 [COMMAND="selphi --refpanel chr22.sr
   truth:    truth.vcf.gz
   shared:   801 samples
   GT scan:  reference call (all alleles 0) in data record 1 → complete callset
-  exclude:  54076 of 1070401 panel sites monomorphic in chr22.srp (54076 new)
+  exclude:  54076 of 1070401 panel sites monomorphic in chr22.srp2 (54076 new)
   Building TBI index in memory for parallel eval: truth.vcf.gz
 
 [1mMAF bin                N variants    Mean R²  Concordance[0m

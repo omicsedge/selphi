@@ -60,15 +60,15 @@ target.
 ## Quick start
 
 ```bash
-# 1. Convert the reference panel once (VCF.gz, BCF or BREF3): writes panel.chr22.srp next to it
+# 1. Convert the reference panel once (VCF.gz, BCF or BREF3): writes panel.chr22.srp2 next to it
 selphi --prepare-reference-from panel.chr22.bcf --threads 16
 
 # 2a. Array or sequencing genotypes (VCF/BCF, phased or not, one or many samples)
-selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map plink.chr22.GRCh38.map \
+selphi --refpanel panel.chr22.srp2 --input samples.vcf.gz --map plink.chr22.GRCh38.map \
   --out imputed --threads 16
 
 # 2b. Low-coverage sequencing, straight from the aligned reads
-selphi --bam sample.bam --reference GRCh38.fa --refpanel panel.chr22.srp \
+selphi --bam sample.bam --reference GRCh38.fa --refpanel panel.chr22.srp2 \
   --map plink.chr22.GRCh38.map --out imputed --threads 16
 ```
 
@@ -88,7 +88,7 @@ what it chose. The result is `imputed.vcf.gz` with its index. Three real runs, r
 ### Arrays and sequencing calls
 
 ```bash
-selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map chr22.map --out imputed --threads 16
+selphi --refpanel panel.chr22.srp2 --input samples.vcf.gz --map chr22.map --out imputed --threads 16
 ```
 
 - Input is VCF or BCF, phased or unphased. Selphi phases the samples, then imputes every panel site.
@@ -118,9 +118,9 @@ does. Each output genotype is the most probable one.
 </p>
 
 ```bash
-selphi --bam sample.cram --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map --out imputed --threads 16
-selphi --bam-list bams.txt --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map --out imputed   # one path per line
-selphi --input sample.pl.vcf.gz --refpanel panel.chr22.srp --map chr22.map --out imputed                   # a VCF/BCF with PL
+selphi --bam sample.cram --reference GRCh38.fa --refpanel panel.chr22.srp2 --map chr22.map --out imputed --threads 16
+selphi --bam-list bams.txt --reference GRCh38.fa --refpanel panel.chr22.srp2 --map chr22.map --out imputed   # one path per line
+selphi --input sample.pl.vcf.gz --refpanel panel.chr22.srp2 --map chr22.map --out imputed                   # a VCF/BCF with PL
 ```
 
 Pass `--reference` for BAM files too: CRAM needs it, and for BAM it enables base alignment quality as in
@@ -131,7 +131,7 @@ Pass `--reference` for BAM files too: CRAM needs it, and for BAM it enables base
 
 ```bash
 selphi --prepare-reference-from panels/ --out all_chromosomes --threads 16     # a folder of per-chromosome BCFs
-selphi --refpanel all_chromosomes.srp --input genome.vcf.gz --map-dir maps/ --out imputed --threads 16
+selphi --refpanel all_chromosomes.srp2 --input genome.vcf.gz --map-dir maps/ --out imputed --threads 16
 ```
 
 The chromosomes run one after the other into one VCF.gz (or BCF with `--bcf`). The same works with `--bam`, which
@@ -140,7 +140,7 @@ writes a VCF.gz and a dosage table. `--map` also accepts one genome-wide map.
 ### Phasing only
 
 ```bash
-selphi --refpanel panel.chr22.srp --input samples.vcf.gz --map chr22.map --out phased --phase-only
+selphi --refpanel panel.chr22.srp2 --input samples.vcf.gz --map chr22.map --out phased --phase-only
 ```
 
 Writes `phased.vcf.gz`. Needs genotype calls and a single-chromosome panel. An input that is already phased gives
@@ -175,7 +175,7 @@ For a ~30x genome with its variant caller's VCF: Selphi writes the caller's file
 where the caller has no variant call and the read depth (base and mapping quality 20) is below 20 (`--calls-depth`).
 
 ```bash
-selphi --bam HG002.cram --reference GRCh38.fa --refpanel panel.chr22.srp --map chr22.map \
+selphi --bam HG002.cram --reference GRCh38.fa --refpanel panel.chr22.srp2 --map chr22.map \
   --calls HG002.deepvariant.vcf.gz --out HG002.merged --threads 16
 ```
 
@@ -207,9 +207,9 @@ slightly from an unbatched run. Temporary files go to `$TMPDIR` (default `/tmp`)
 ### Reference panels
 
 ```bash
-selphi --prepare-reference-from panel.chr22.bcf --threads 16           # BCF (with .csi), VCF.gz or BREF3 -> .srp
-selphi --merge-srps-dir srps/ --out all_chromosomes                    # per-chromosome .srp -> one file
-selphi --prepare-reference-from panel.srp --out panel.bcf --threads 16  # .srp or .bref3 -> BCF or VCF.gz
+selphi --prepare-reference-from panel.chr22.bcf --threads 16           # BCF (with .csi), VCF.gz or BREF3 -> .srp2
+selphi --merge-srps-dir srps/ --out all_chromosomes                    # per-chromosome .srp2 -> one file
+selphi --prepare-reference-from panel.srp2 --out panel.bcf --threads 16  # .srp2 or .bref3 -> BCF or VCF.gz
 ```
 
 A BCF is read in parallel with constant memory; a VCF.gz is loaded into memory first.
@@ -217,12 +217,12 @@ A BCF is read in parallel with constant memory; a VCF.gz is loaded into memory f
 ### Accuracy evaluation
 
 ```bash
-selphi --refpanel panel.chr22.srp --input array.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz
+selphi --refpanel panel.chr22.srp2 --input array.vcf.gz --map chr22.map --out imputed --truth truth.vcf.gz
 selphi --evaluate imputed.vcf.gz --truth truth.vcf.gz --out eval
 ```
 
 Reports R² and concordance per site and per sample, by minor allele frequency, as text and JSON. Useful options:
-`--exclude-sites array.vcf.gz` (score imputed sites only), `--exclude-panel-monomorphic panel.srp`,
+`--exclude-sites array.vcf.gz` (score imputed sites only), `--exclude-panel-monomorphic panel.srp2`,
 `--homref-absent on` (sites absent from the truth count as reference), `--by-type` (SNPs and indels apart).
 Low-coverage output is scored with `--evaluate`.
 
@@ -230,7 +230,7 @@ Low-coverage output is scored with `--evaluate`.
 output path on a small single-chromosome panel:
 
 ```bash
-selphi --self-test --refpanel panel.chr22.srp --input target.vcf.gz --map chr22.map --out selftest --truth truth.vcf.gz
+selphi --self-test --refpanel panel.chr22.srp2 --input target.vcf.gz --map chr22.map --out selftest --truth truth.vcf.gz
 ```
 
 ## Output
@@ -262,7 +262,7 @@ Sites typed in the input keep their calls and carry `GT` only; a missing call th
 
 | Option | Meaning |
 |---|---|
-| `--refpanel FILE` | reference panel (`.srp`) |
+| `--refpanel FILE` | reference panel (`.srp2`) |
 | `--input FILE` / `--bam FILE` | target genotypes (VCF/BCF) or aligned reads (BAM/CRAM) |
 | `--map FILE` / `--map-dir DIR` | genetic map(s), PLINK format |
 | `--out PREFIX` | output prefix |
