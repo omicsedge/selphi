@@ -422,9 +422,7 @@ fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> i
         if k == gtk {
             // As the SRP builder: int8 diploid-width GT, phased.
             if tid != 1 || vl != 2 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                    "GT is not int8 diploid (type_id={}, ploidy={}); Selphi requires diploid \
-                     int8 GT panels — normalize haploid/multi-ploidy records first", tid, vl)));
+                return Err(super::bcf_reader::gt_shape_error(pos as i64, tid, vl));
             }
             let ge = (io2 + fs).min(ib.len());
             for si in 0..n_samples {
