@@ -99,6 +99,7 @@ fn main() {
         if args.merge_srps.is_some() { modes.push("--merge-srps"); }
         if args.merge_srps_dir.is_some() { modes.push("--merge-srps-dir"); }
         if args.prepare_reference_from.is_some() { modes.push("--prepare-reference-from"); }
+        if args.refpanel_dir.is_some() { modes.push("--refpanel-dir"); }
         if modes.len() > 1 {
             eprintln!("ERROR: the following are mutually exclusive top-level modes; pick one: {}.",
                 modes.join(", "));
@@ -388,7 +389,7 @@ fn main() {
             };
             match r.split_once(':') {
                 Some((c, range)) => {
-                    let (s, e) = range.split_once('-').unwrap_or((range, range));
+                    let (s, e) = range.split_once('-').unwrap_or((range, ""));
                     (c.to_string(), parse(s, 1), parse(e, i64::MAX))
                 }
                 None => (r.to_string(), 1, i64::MAX),
@@ -551,7 +552,7 @@ fn main() {
 
     // --- Evaluate accuracy mode ---
     if let Some(ref imputed) = args.evaluate {
-        let truth = args.truth.as_ref().expect("--truth required with --evaluate");
+        let truth = required(args.truth.as_deref(), "--truth required with --evaluate");
         let output = args.out.as_deref().unwrap_or("eval_results");
 
         let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
@@ -652,17 +653,17 @@ pass --homref-absent on to apply it (matched-sites scoring ignores it)");
     if let Some(ref panel_dir) = args.refpanel_dir {
         if args.phase_only {
             selphi_error!("--phase-only is not supported on the multi-chromosome path (--refpanel-dir); \
-run per chromosome with a single-chr .srp, or drop --phase-only");
+run per chromosome with a single-chr .srp2, or drop --phase-only");
             std::process::exit(2);
         }
-        let input = args.input.as_ref().expect("--input required with --refpanel-dir");
-        let map_dir = args.map_dir.as_ref().expect("--map-dir required with --refpanel-dir");
+        let input = required(args.input.as_deref(), "--input required with --refpanel-dir");
+        let map_dir = required(args.map_dir.as_deref(), "--map-dir required with --refpanel-dir");
         let out = args.out.as_deref().unwrap_or("imputed");
 
         // std::env::temp_dir() honours TMPDIR (macOS → /var/folders/…) and falls
         // back to /tmp on Linux, keeping temporary storage portable.
         let temp_srp = std::env::temp_dir()
-            .join(format!("selphi_refpanel_dir_{}.srp", std::process::id()));
+            .join(format!("selphi_refpanel_dir_{}.{}", std::process::id(), selphi::srp::PANEL_EXT));
         selphi_step!("Merging per-chr SRPs from {} → {}", panel_dir, temp_srp.display());
         selphi::srp::multi_chr_writer::merge_srps_from_dir(
             Path::new(panel_dir), &temp_srp,
@@ -671,7 +672,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
             std::process::exit(1);
         });
 
-        let config = orchestrate::MultiChrImputeConfig::from_args(&args, Some(map_dir.clone()));
+        let config = orchestrate::MultiChrImputeConfig::from_args(&args, Some(map_dir.to_string()));
 
         let result = orchestrate::run_multi_chr(
             &temp_srp, input, Path::new(map_dir), out, &config,
@@ -702,8 +703,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     if args.self_test {
         let config = self_test::SelfTestConfig {
             refpanel: &args.refpanel,
-            input: args.input.as_ref().expect("--input required for --self-test"),
-            map: args.map_path.as_ref().expect("--map required for --self-test"),
+            input: required(args.input.as_deref(), "--input required for --self-test"),
+            map: required(args.map_path.as_deref(), "--map required for --self-test"),
             out_base: args.out.as_deref().unwrap_or("self_test_output"),
             truth: args.truth.as_deref(),
             threads: args.threads,
@@ -777,17 +778,17 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
             return;
         }
 
-        let is_srp_input = source.ends_with(".srp");
+        let is_srp_input = selphi::srp::is_panel_path(source);
         // Strip the compound panel suffix before appending, so panel.vcf.gz →
-        // panel.srp (not panel.vcf.srp, which with_extension would leave).
+        // panel.srp2 (not panel.vcf.srp2, which with_extension would leave).
         let stem = source.strip_suffix(".vcf.gz").or_else(|| source.strip_suffix(".bcf"))
-            .or_else(|| source.strip_suffix(".bref3")).or_else(|| source.strip_suffix(".srp"))
+            .or_else(|| source.strip_suffix(".bref3")).or_else(|| source.strip_suffix(".srp2")).or_else(|| source.strip_suffix(".srp"))
             .unwrap_or(source);
-        let auto_output = format!("{}.{}", stem, if is_srp_input { "bref3" } else { "srp" });
+        let auto_output = format!("{}.{}", stem, if is_srp_input { "bref3" } else { selphi::srp::PANEL_EXT });
         let output = args.out.as_deref().unwrap_or(&auto_output);
 
         // Fast native panel decode: BREF3/SRP → VCF.gz or BCF (replaces Beagle
-        // UnBref3). Triggers only on a .bref3/.srp source with an explicit
+        // UnBref3). Triggers only on a .bref3/.srp2 source with an explicit
         // .vcf.gz / .bcf output, so every existing prepare-reference /
         // export-bref3 path is unchanged.
         let want_decode = (source.ends_with(".bref3") || is_srp_input)
@@ -796,7 +797,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         selphi::common::utils::refuse_overwrite(&[source], &[
             if want_decode { PathBuf::from(output) }
             else if output_bref3 { selphi::srp::helpers::with_panel_suffix(Path::new(output), "bref3") }
-            else { selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp") }]).unwrap_or_else(|f| exit_with(&f));
+            else { selphi::srp::helpers::with_panel_suffix(Path::new(output), selphi::srp::PANEL_EXT) }]).unwrap_or_else(|f| exit_with(&f));
         if want_decode {
             let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
             selphi::log::init(&log_path, args.debug);
@@ -849,7 +850,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                 // VCF/VCF.gz: no direct VCF→BREF3 reader; build a VCF-capable
                 // interim SRP then convert (byte-identical to a BCF-built BREF3).
                 let tmp_srp = std::env::temp_dir()
-                    .join(format!("selphi_bref3_interim_{}.srp", std::process::id()));
+                    .join(format!("selphi_bref3_interim_{}.{}", std::process::id(), selphi::srp::PANEL_EXT));
                 selphi::srp::writer::build_srp_any(Path::new(source), &tmp_srp, args.threads, args.chunk_size)
                     .unwrap_or_else(|e| { if let Some(f) = e.fatal() { exit_with(f) } selphi_error!("BREF3 write failed (SRP stage): {}", e); std::process::exit(1); });
                 selphi::srp::bref3_writer::write_bref3_from_srp(&tmp_srp, Path::new(output))
@@ -857,7 +858,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                 let _ = std::fs::remove_file(&tmp_srp);
             }
         } else if is_bref3 {
-            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp");
+            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), selphi::srp::PANEL_EXT);
             selphi::srp::writer::build_srp_from_bref3(
                 Path::new(source), &srp_path, args.threads, args.chunk_size)
                 .unwrap_or_else(|e| { selphi_error!("{}", e); std::process::exit(1); });
@@ -868,7 +869,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
             // `--phase-panel --srp` uses — so a VCF is a first-class reference
             // source. Peak memory is bounded to the panel (no whole-file text
             // buffer, no intermediate genotype matrix).
-            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp");
+            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), selphi::srp::PANEL_EXT);
 
             selphi_step!("Reading VCF panel (streaming)...");
             let (sample_names, markers, phased, n_haps, is_phased) =
@@ -914,7 +915,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
                     .unwrap_or(false),
             };
 
-            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), "srp");
+            let srp_path = selphi::srp::helpers::with_panel_suffix(Path::new(output), selphi::srp::PANEL_EXT);
 
             if is_multi_contig {
                 selphi_info!("  Detected multi-contig source → building multi-chr SRP\n");
@@ -938,8 +939,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         eprintln!("ERROR: --refpanel is required for imputation");
         std::process::exit(1);
     }
-    let target_path = args.input.as_deref().expect("--input is required");
-    let output_path = args.out.as_deref().expect("--out is required");
+    let target_path = required(args.input.as_deref(), "--input is required");
+    let output_path = required(args.out.as_deref(), "--out is required");
     selphi::common::utils::refuse_overwrite(&[target_path], &[
         selphi::common::utils::out_path(Path::new(output_path), if args.bcf { "bcf" } else { "vcf.gz" })]).unwrap_or_else(|f| exit_with(&f));
 
@@ -970,8 +971,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         if args.phase_only {
             // orchestrate.rs never reads phase_only: without this guard a phased-VCF
             // request against a multi-chr panel ran a full imputation and wrote dosages.
-            selphi_error!("--phase-only is not supported on the multi-chromosome path (multi-chr .srp); \
-run per chromosome with a single-chr .srp, or drop --phase-only");
+            selphi_error!("--phase-only is not supported on the multi-chromosome path (multi-chr .srp2); \
+run per chromosome with a single-chr .srp2, or drop --phase-only");
             std::process::exit(2);
         }
         let config = orchestrate::MultiChrImputeConfig::from_args(&args, args.map_dir.clone());
@@ -993,6 +994,11 @@ fn exit_with(f: &selphi::Fatal) -> ! {
 
 /// An `io::Error` out of a library call: the [`selphi::Fatal`] it carries ends the
 /// run as already reported; any other error is printed by `report`, then exit 1.
+/// A flag the chosen mode needs: missing is a usage error, not a panic.
+fn required<'a>(v: Option<&'a str>, msg: &str) -> &'a str {
+    v.unwrap_or_else(|| { eprintln!("ERROR: {msg}"); std::process::exit(1) })
+}
+
 fn exit_on_io(e: &std::io::Error, report: impl FnOnce()) -> ! {
     if let Some(f) = selphi::Fatal::of(e) { exit_with(f) }
     report();

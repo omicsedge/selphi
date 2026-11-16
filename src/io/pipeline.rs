@@ -2304,10 +2304,8 @@ fn interp_kernel(
             let s2 = w.indptr[chip_e] as usize;
             let e2 = w.indptr[chip_e + 1] as usize;
 
-            let mut ss: f32 = 0.0;
-            ss += w.range_sum(s1, e1);
-            let mut es: f32 = 0.0;
-            es += w.range_sum(s2, e2);
+            let ss = w.range_sum(s1, e1);
+            let es = w.range_sum(s2, e2);
             let ds = es - ss;
 
             if ss == 0.0 && ds == 0.0 { return; }
@@ -2505,10 +2503,8 @@ fn interpolate_tile_rows(
             let e1 = w.indptr[chip_s + 1] as usize;
             let s2 = w.indptr[chip_e] as usize;
             let e2 = w.indptr[chip_e + 1] as usize;
-            let mut ss: f32 = 0.0;
-            ss += w.range_sum(s1, e1);
-            let mut es: f32 = 0.0;
-            es += w.range_sum(s2, e2);
+            let ss = w.range_sum(s1, e1);
+            let es = w.range_sum(s2, e2);
             let ds = es - ss;
             if ss == 0.0 && ds == 0.0 { return; }
 

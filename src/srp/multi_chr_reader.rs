@@ -1,6 +1,6 @@
 //! Multi-chromosome SRP reader.
 //!
-//! Opens a multi-chromosome .srp file, reads the global header and chromosome
+//! Opens a multi-chromosome .srp2 file, reads the global header and chromosome
 //! directory, and provides per-chromosome views (`ChrSrpView`) that expose
 //! the same interface as `SrpReader` for downstream pipeline code.
 

@@ -29,7 +29,15 @@ pub struct BcfHeader {
 /// The header of a BCF whose genotypes are read: without a GT line the key would default to
 /// FORMAT id 0 (often PL or DP), read as genotypes. Readers of other fields (a DS-only file
 /// scored by the evaluator) use [`read_header_only`].
-fn read_genotype_header(path: &Path) -> io::Result<BcfHeader> {
+/// A GT vector that is not int8 and 2 wide: where it is and how to make the panel readable.
+pub(crate) fn gt_shape_error(pos: i64, type_id: u8, ploidy: usize) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!(
+        "GT at position {} is not int8 diploid (type_id={}, ploidy={}): a Selphi panel needs every record \
+         diploid. A haploid chromosome (chrY, chrM, a male-only chrX) can be made diploid first, each call \
+         becoming its homozygote: bcftools +fixploidy in.bcf -Ob -o out.bcf -- -f 2", pos, type_id, ploidy))
+}
+
+pub(crate) fn read_genotype_header(path: &Path) -> io::Result<BcfHeader> {
     let header = read_header_only(path)?;
     if header.n_samples > 0 && !header.has_gt {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
@@ -259,9 +267,7 @@ fn process_region(
                 // (2 bytes/sample). A haploid-width (vl=1) or int16 (type 2) GT
                 // would be read with the wrong stride → silent mis-decode; reject it.
                 if tid2 != 1 || vl != 2 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                        "GT is not int8 diploid (type_id={}, ploidy={}); Selphi requires diploid \
-                         int8 GT panels — normalize haploid/multi-ploidy records first", tid2, vl)));
+                    return Err(gt_shape_error(rec_pos, tid2, vl));
                 }
                 let ge = (io2 + fs).min(ib.len());
                 for si in 0..ns {
@@ -550,9 +556,7 @@ fn decode_region_dense(
                 // (2 bytes/sample). A haploid-width (vl=1) or int16 (type 2) GT
                 // would be read with the wrong stride → silent mis-decode; reject it.
                 if tid2 != 1 || vl != 2 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
-                        "GT is not int8 diploid (type_id={}, ploidy={}); Selphi requires diploid \
-                         int8 GT panels — normalize haploid/multi-ploidy records first", tid2, vl)));
+                    return Err(gt_shape_error(rec_pos, tid2, vl));
                 }
                 let ge = (io2 + fs).min(ib.len());
                 for si in 0..ns {

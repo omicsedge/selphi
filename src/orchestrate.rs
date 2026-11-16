@@ -690,9 +690,9 @@ pub fn run_multi_chr(
         if config.selfdecode || config.all_formats { unsupported.push("--selfdecode"); }
         if !unsupported.is_empty() {
             selphi_error!(
-                "{} not supported on the multi-chromosome path (a multi-chr .srp, or --refpanel-dir). \
+                "{} not supported on the multi-chromosome path (a multi-chr .srp2, or --refpanel-dir). \
                  Only VCF.gz and BCF are written here. Run one chromosome at a time to get {}, \
-                 e.g. --refpanel chr22.srp --region 22 (or split the target and loop over chromosomes).",
+                 e.g. --refpanel chr22.srp2 --region 22 (or split the target and loop over chromosomes).",
                 unsupported.join(", "), unsupported.join(" / "),
             );
             std::process::exit(2);

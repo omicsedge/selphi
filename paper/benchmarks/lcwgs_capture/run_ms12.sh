@@ -11,7 +11,7 @@ GMAP=$DATA_ROOT/work/lcwgs_sweep/glimpse.gmap; CH=$DATA_ROOT/work/lcwgs_sweep/t6
 D=dbg_arm/ms; say(){ echo "[$(date -Is)] $*"; }
 { for s in NA24143 NA24149 NA24385 NA24631 NA24694 NA24695; do echo ${s}_chr22.bam; echo $D/${s}_dup_chr22.bam; done; } > $D/bams12.txt
 say "Selphi n=12 --bam-list, default iterations, LCWGS_TIMING"
-LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam-list $D/bams12.txt --reference $REF --refpanel s2_chr22_noleak.srp --map $MAP --out $D/sel_n12 --threads 16 > $D/sel_n12.log 2>&1
+LCWGS_TIMING=1 /usr/bin/time -v $S2 --lcwgs --bam-list $D/bams12.txt --reference $REF --refpanel s2_chr22_noleak.srp2 --map $MAP --out $D/sel_n12 --threads 16 > $D/sel_n12.log 2>&1
 say "GLIMPSE2 n=12 --bam-list"
 T0=$(date +%s); rm -f $D/g2list12.txt
 while read idx chr ireg oreg rest; do

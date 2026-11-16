@@ -261,11 +261,12 @@ mod tests {
 /// the chromosome tag and making per-chromosome rebuilds overwrite one file
 /// with the next. A `--out` value
 /// is a NAME, not a stem: keep it whole and append the panel suffix unless it
-/// is already there. `ext` is `"srp"` or `"bref3"`.
+/// is already there. `ext` is `PANEL_EXT` or `"bref3"`; a panel named `.srp` (the
+/// earlier extension) keeps its name.
 pub fn with_panel_suffix(path: &std::path::Path, ext: &str) -> std::path::PathBuf {
     let s = path.to_string_lossy();
     let dotted = format!(".{ext}");
-    if s.ends_with(&dotted) {
+    if s.ends_with(&dotted) || (ext == super::PANEL_EXT && s.ends_with(".srp")) {
         path.to_path_buf()
     } else {
         std::path::PathBuf::from(format!("{s}{dotted}"))
@@ -275,21 +276,23 @@ pub fn with_panel_suffix(path: &std::path::Path, ext: &str) -> std::path::PathBu
 #[cfg(test)]
 mod panel_suffix_tests {
     use super::with_panel_suffix;
+    use super::super::PANEL_EXT;
     use std::path::Path;
     #[test]
     fn a_chromosome_tag_is_kept() {
-        assert_eq!(with_panel_suffix(Path::new("panel.chr22"), "srp").to_str().unwrap(), "panel.chr22.srp");
+        assert_eq!(with_panel_suffix(Path::new("panel.chr22"), PANEL_EXT).to_str().unwrap(), "panel.chr22.srp2");
         assert_eq!(with_panel_suffix(Path::new("/x/y/v3.chr1"), "bref3").to_str().unwrap(), "/x/y/v3.chr1.bref3");
     }
     #[test]
     fn an_existing_suffix_is_not_doubled() {
-        assert_eq!(with_panel_suffix(Path::new("panel.srp"), "srp").to_str().unwrap(), "panel.srp");
+        assert_eq!(with_panel_suffix(Path::new("panel.srp2"), PANEL_EXT).to_str().unwrap(), "panel.srp2");
+        assert_eq!(with_panel_suffix(Path::new("panel.srp"), PANEL_EXT).to_str().unwrap(), "panel.srp");
         assert_eq!(with_panel_suffix(Path::new("panel.bref3"), "bref3").to_str().unwrap(), "panel.bref3");
     }
     #[test]
     fn a_bare_name_gets_the_suffix() {
-        assert_eq!(with_panel_suffix(Path::new("panel"), "srp").to_str().unwrap(), "panel.srp");
-        assert_eq!(with_panel_suffix(Path::new("out/panel_v3"), "srp").to_str().unwrap(), "out/panel_v3.srp");
+        assert_eq!(with_panel_suffix(Path::new("panel"), PANEL_EXT).to_str().unwrap(), "panel.srp2");
+        assert_eq!(with_panel_suffix(Path::new("out/panel_v3"), PANEL_EXT).to_str().unwrap(), "out/panel_v3.srp2");
     }
 }
 

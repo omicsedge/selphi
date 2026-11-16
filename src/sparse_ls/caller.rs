@@ -714,6 +714,24 @@ mod tests {
         }
     }
 
+    /// Haploid with a rare last site: its GL pair is the last two slots (no third to read).
+    #[test]
+    fn caller_haploid_rare_last_site() {
+        let n_sites = 5;
+        let n_haps = 2000; // one carrier in 2,000: below the rare (sparse) MAF
+        let allele = |s: usize, h: usize| -> bool { if s + 1 == n_sites { h == 0 } else { (h + s) % 2 == 0 } };
+        let (ref_hs, ref_bm, vmap, cm) = build_tiny_panel(n_sites, n_haps, &[0.0, 0.1, 0.2, 0.3, 0.4], allele);
+        let mut g = Genotype::new("h0".into(), 0, n_sites, 1, 0);
+        // ALT likely everywhere; certain (PL 60, beyond the 1/2,000 prior) at the rare site.
+        for l in 0..n_sites { g.set_pl(l, &[if l + 1 == n_sites { 60 } else { 25 }, 0, 0]); }
+        let mut genotypes = vec![g];
+        let params = LsParams { kpbwt: n_haps, kinit: 6, burnin: 1, main: 2, ..Default::default() };
+        LsExactCaller::run(&ref_hs, &ref_bm, &vmap, &cm, &mut genotypes, &params, 12345);
+        let dose = &collect_calls(&genotypes, n_sites)[0].dose;
+        assert_eq!(dose.len(), n_sites);
+        assert!(dose[n_sites - 1] > 0.5, "certain ALT at the rare site: {}", dose[n_sites - 1]);
+    }
+
     /// `increment_iteration` collapses through INIT→BURN→MAIN with the right
     /// iteration counts, and stops past MAIN.
     #[test]

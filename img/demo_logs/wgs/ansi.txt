@@ -1,4 +1,4 @@
-Script started on 2026-11-04 07:57:57+00:00 [COMMAND="selphi --refpanel chr22.srp --input wgs.vcf.gz --map chr22.map --out phased --phase-only --threads 16 " <not executed on terminal>]
+Script started on 2026-11-04 07:57:57+00:00 [COMMAND="selphi --refpanel chr22.srp2 --input wgs.vcf.gz --map chr22.map --out phased --phase-only --threads 16 " <not executed on terminal>]
 [1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
   auto-route: sniff GT=true PL=false GQ=false DP=false call-rate=1.000 (of 108000 GT entries) density=26022/Mb (thr 1000) settled PL 0/0 (variant records 0/0, blocks 0) [2m[0.0s | 627 MB][0m
   auto-route: confident hard calls (GT-only, or GQ/DP below WGS density) [32m→ genotype engine (no refine)[0m [2m[0.0s | 627 MB][0m
@@ -10,7 +10,7 @@ Script started on 2026-11-04 07:57:57+00:00 [COMMAND="selphi --refpanel chr22.sr
       [2mv2.0.0[0m 🦀 [32mSelfDecode™[0m
 
   input:    wgs.vcf.gz
-  refpanel: chr22.srp
+  refpanel: chr22.srp2
   map:      chr22.map
   output:   phased
   threads:  16

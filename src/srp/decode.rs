@@ -316,10 +316,10 @@ pub fn decode_panel(source: &Path, output: &Path, threads: usize, extra_header: 
 
     let (nvar, n_samples, n_haps) = if src.ends_with(".bref3") {
         decode_bref3(source, output, fmt, threads, extra_header)?
-    } else if src.ends_with(".srp") {
+    } else if super::is_panel_path(&src) {
         decode_srp(source, output, fmt, threads, extra_header)?
     } else {
-        return Err(format!("decode_panel: unsupported source {} (want .bref3 or .srp)", src));
+        return Err(format!("decode_panel: unsupported source {} (want .bref3 or .srp2)", src));
     };
 
     index_output(output, fmt);

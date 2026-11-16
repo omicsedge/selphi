@@ -1,7 +1,7 @@
 //! SRP (Sparse Reference Panel) reader and writer.
 //!
-//! The `.srp` format is a binary, tile-based sparse panel (the legacy
-//! zstd-ZIP/`.npz` archive layout is gone). Two variants, distinguished by an
+//! The `.srp2` format is a binary, tile-based sparse panel (Selphi 1's zstd-ZIP
+//! `.srp` archive is a different format, refused on open). Two variants, distinguished by an
 //! 8-byte magic:
 //!   - Single-chr (`SRP_SINGLE_CHR_MAGIC`, `b"SRP\0\x02.."`, v2): header +
 //!     variant index + sample IDs + 2D sparse tiles.
@@ -46,6 +46,27 @@ pub const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Magic bytes for multi-chromosome SRP format.
 pub const SRP_MULTI_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
+
+/// A panel file's extension. Panels written as `.srp` before it still open: the magic,
+/// not the name, decides the format.
+pub const PANEL_EXT: &str = "srp2";
+
+/// Whether `path` names a panel: `.srp2`, or `.srp` from earlier builds.
+pub fn is_panel_path(path: &str) -> bool { path.ends_with(".srp2") || path.ends_with(".srp") }
+
+/// Refuses a directory listing that holds `x.srp` and `x.srp2` both: one panel under its earlier
+/// and its current name, or two builds; which one to read is the user's choice.
+pub fn refuse_both_panel_names(files: &[std::path::PathBuf]) -> std::io::Result<()> {
+    for f in files.iter().filter(|f| f.extension().is_some_and(|e| e == "srp")) {
+        let twin = f.with_extension(PANEL_EXT);
+        if files.contains(&twin) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!(
+                "{} and {} are both in the directory: keep one (.srp2 is the current name of a .srp panel)",
+                f.display(), twin.display())));
+        }
+    }
+    Ok(())
+}
 
 /// Sibling magics of a panel whose variant index (any chromosome's, for a multi-chr
 /// file) holds a field of 255 B or longer, i.e. is written behind
@@ -440,6 +461,15 @@ pub fn blake2b_hex(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn panel_dir_refuses_one_panel_under_both_names() {
+        use std::path::PathBuf;
+        let both = [PathBuf::from("d/chr22.srp"), PathBuf::from("d/chr22.srp2")];
+        assert!(super::refuse_both_panel_names(&both).is_err());
+        let ok = [PathBuf::from("d/chr21.srp"), PathBuf::from("d/chr22.srp2")];
+        assert!(super::refuse_both_panel_names(&ok).is_ok());
+    }
+
     use super::*;
 
     #[test]

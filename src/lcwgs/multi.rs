@@ -32,14 +32,15 @@ pub enum Input<'a> {
 
 fn bare(c: &str) -> &str { c.strip_prefix("chr").unwrap_or(c) }
 
-/// The `.srp` files of a directory, in name order.
+/// The panel files of a directory (`.srp2`, or `.srp` from earlier builds), in name order.
 pub fn srp_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)?.flatten().map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "srp")).collect();
+        .filter(|p| crate::srp::is_panel_path(&p.to_string_lossy())).collect();
     v.sort();
     if v.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no .srp file in {}", dir.display())));
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no .srp2 or .srp file in {}", dir.display())));
     }
+    crate::srp::refuse_both_panel_names(&v)?;
     Ok(v)
 }
 

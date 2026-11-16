@@ -11,7 +11,7 @@ pub fn median(sorted: &[f64]) -> f64 {
 /// Derive an output filename from a user-supplied `--out` base.
 ///
 /// `Path::with_extension` REPLACES whatever follows the last dot, so applying it
-/// to `--out panel.chr15` produces `panel.vcf.gz` and `panel.srp`, dropping the
+/// to `--out panel.chr15` produces `panel.vcf.gz` and `panel.srp2`, dropping the
 /// chromosome tag. Preserving the tag prevents missing-file errors in downstream
 /// steps and prevents 22 chromosome outputs from colliding on one filename.
 ///
@@ -24,7 +24,7 @@ pub fn median(sorted: &[f64]) -> f64 {
 ///   panel.vcf.gz  + "vcf.gz" -> panel.vcf.gz         (idempotent, no doubling)
 ///   panel.vcf     + "srp"    -> panel.srp            (a real extension IS replaced)
 pub fn out_path(base: &std::path::Path, ext: &str) -> std::path::PathBuf {
-    const KNOWN: &[&str] = &["vcf.gz", "vcf", "bcf", "srp", "bref3", "pgen", "psam", "pvar",
+    const KNOWN: &[&str] = &["vcf.gz", "vcf", "bcf", "srp2", "srp", "bref3", "pgen", "psam", "pvar",
                              "parquet", "selfdecode.zip", "gz"];
     // Only the file name can carry an extension (a dotted parent directory is left
     // alone), and it is matched as BYTES: every suffix we recognise is ASCII, so a

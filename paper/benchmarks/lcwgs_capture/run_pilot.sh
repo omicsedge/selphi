@@ -125,13 +125,13 @@ fi
 # ---------- S6b: imputation with Selphi 2 ----------
 if ! stage_done s6b; then
   say "S6b: Selphi 2 imputation chr22"
-  if [ ! -f s2_chr22.srp ]; then
-    say "S6b: prepare reference .srp for Selphi 2 from BCF"
-    "$S2BIN" --prepare-reference-from "$BCF22" --out s2_chr22 --threads 16 > selphi2_prep.log 2>&1 || \
+  if [ ! -f s2_chr22.srp2 ]; then
+    say "S6b: prepare reference .srp2 for Selphi 2 from BCF"
+    "$S2BIN" --prepare-reference-from "$BCF22" --out s2_chr22.srp2 --threads 16 > selphi2_prep.log 2>&1 || \
       { say "S6b prep FAILED:"; tail -5 selphi2_prep.log; }
   fi
-  if [ -f s2_chr22.srp ]; then
-    if "$S2BIN" --refpanel s2_chr22.srp --input target_chr22_nochr.vcf.gz \
+  if [ -f s2_chr22.srp2 ]; then
+    if "$S2BIN" --refpanel s2_chr22.srp2 --input target_chr22_nochr.vcf.gz \
         --map "$MAP22" --out imputed_selphi2_chr22 --threads 16 > selphi2_run.log 2>&1; then
       say "S6b: OK"
     else
@@ -185,7 +185,7 @@ if ! stage_done s9; then
       | bcftools annotate --rename-chrs rename_to_nochr.txt -Ou \
       | bcftools call -Aim -C alleles -T panel22_alleles.tsv.gz --threads 4 -Oz -o gl_chr22_nochr.vcf.gz 2> call_lcwgs.log && \
     bcftools index -f -t gl_chr22_nochr.vcf.gz && \
-    "$S2BIN" --lcwgs --refpanel s2_chr22.srp --input gl_chr22_nochr.vcf.gz \
+    "$S2BIN" --lcwgs --refpanel s2_chr22.srp2 --input gl_chr22_nochr.vcf.gz \
         --map "$MAP22" --out imputed_lcwgs_chr22 --threads 16 > selphi2_lcwgs.log 2>&1 && \
     bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%GT]\n' imputed_lcwgs_chr22.vcf.gz \
       | awk 'length($3)==1 && length($4)==1 {print "chr"$1"\t"$2"\t"$3"\t"$4"\t"$5}' > imputed_lcwgs.tsv && \

@@ -147,6 +147,11 @@ fn scan_bcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
 
     let header = String::from_utf8_lossy(&header_bytes);
     let meta = parse_header(&header);
+    // GT's dictionary index (its IDX=), to tell a GT vector from another FORMAT field; without
+    // IDX= the first FORMAT field is taken as GT, as the VCF spec places it.
+    let gt_idx: Option<u32> = header.lines().find(|l| l.starts_with("##FORMAT=<ID=GT,"))
+        .and_then(|l| l.split("IDX=").nth(1)).and_then(|s| s.split([',', '>']).next())
+        .and_then(|s| s.parse().ok());
 
     // Scan records
     let mut regions: std::collections::BTreeMap<i32, (i64, i64, usize)> = std::collections::BTreeMap::new();
@@ -178,10 +183,16 @@ fn scan_bcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
         if !checked_phase && l_indiv > 0 {
             let mut indiv = vec![0u8; l_indiv];
             io::Read::read_exact(bgzf, &mut indiv)?;
-            // BCF GT encoding: phased bit is in the LSB of each allele
-            // First allele byte after GT type header: if allele & 1 == 1 → phased
-            if indiv.len() > 4 {
-                is_phased = indiv[3] & 1 == 1;
+            // BCF FORMAT: a typed-int key (GT comes first), the vector's type byte, then the
+            // first sample's alleles; the phase bit is the LSB of the second allele (the
+            // first's is always 0), unless that slot is end-of-vector padding (0x81).
+            let key_w = match indiv.first().map(|t| t & 0x0f) { Some(1) => 1, Some(2) => 2, Some(3) => 4, _ => 0 };
+            let t = 1 + key_w;
+            let key = (key_w > 0 && indiv.len() > t)
+                .then(|| indiv[1..t].iter().rev().fold(0u32, |k, &b| (k << 8) | b as u32));
+            if key.is_some() && gt_idx.map_or(true, |g| key == Some(g)) && indiv.len() > t + 2 && indiv[t] & 0x0f == 1 && indiv[t] >> 4 >= 2 {
+                let b1 = indiv[t + 2];
+                is_phased = b1 != 0x81 && b1 & 1 == 1;
             }
             checked_phase = true;
         } else {
@@ -216,13 +227,14 @@ fn scan_vcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
 
     // Split into header and data
     let mut header_end = 0;
+    let mut offset = 0;
     for line in buf.split(|&b| b == b'\n') {
         if line.starts_with(b"#CHROM") {
-            let chrom_pos = buf.windows(6).position(|w| w == b"#CHROM").unwrap_or(0);
-            header_end = chrom_pos + line.len();
+            header_end = offset + line.len();
             break;
         }
         if !line.starts_with(b"#") { break; }
+        offset += line.len() + 1;
     }
 
     let header = String::from_utf8_lossy(&buf[..header_end]);
@@ -252,7 +264,8 @@ fn scan_vcf(bgzf: &mut impl io::Read) -> io::Result<FileInfo> {
 
             // Check phase from first data line
             if !checked_phase {
-                is_phased = line.windows(1).skip(tab1).any(|w| w == b"|");
+                let gt = line.split(|&b| b == b'\t').nth(9).unwrap_or(b"");
+                is_phased = gt.iter().take_while(|&&b| b != b':').any(|&b| b == b'|');
                 checked_phase = true;
             }
         }

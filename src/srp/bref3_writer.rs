@@ -38,7 +38,7 @@ enum RecEncoding { Seq, Allele }
 pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Result<()> {
     use super::bcf_reader;
 
-    let hdr = bcf_reader::read_header_only(source_path)?;
+    let hdr = bcf_reader::read_genotype_header(source_path)?;
     let n_haps = hdr.n_samples * 2;
     let n_samples = hdr.n_samples;
     let max_n_seq = default_max_n_seq(n_samples);
@@ -126,7 +126,7 @@ pub fn write_bref3_from_bcf(source_path: &Path, output_path: &Path) -> io::Resul
         // --- Parallel GT extraction ---
         let parsed: Vec<VariantRec> = raw_batch.par_iter().map(|raw| {
             parse_bcf_gt(raw, n_haps, n_samples, gtk)
-        }).collect();
+        }).collect::<io::Result<_>>()?;
 
         // --- Sequential SeqCoder with parallel inner loops ---
         for rec in parsed {
@@ -393,7 +393,7 @@ fn seq_coder_update(
 }
 
 /// Parse GT from raw BCF record bytes (called from rayon).
-fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> VariantRec {
+fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> io::Result<VariantRec> {
     let sb = &raw.shared;
     let ib = &raw.indiv;
     let pos = i32::from_le_bytes(sb[4..8].try_into().unwrap()) + 1;
@@ -408,6 +408,7 @@ fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> V
     let alt_allele = allele_strs.get(1).cloned().unwrap_or_default();
 
     let mut alleles = vec![0u8; n_haps];
+    let mut gt_found = n_samples == 0;
     let mut io2 = 0usize;
     for _ in 0..nf {
         if io2 >= ib.len() { break; }
@@ -419,26 +420,45 @@ fn parse_bcf_gt(raw: &RawBcfRec, n_haps: usize, n_samples: usize, gtk: u16) -> V
         let es = match tid { 1=>1, 2=>2, 3=>4, 5=>4, 7=>1, _=>1 };
         let fs = vl * es * n_samples;
         if k == gtk {
+            // As the SRP builder: int8 diploid-width GT, phased.
+            if tid != 1 || vl != 2 {
+                return Err(super::bcf_reader::gt_shape_error(pos as i64, tid, vl));
+            }
             let ge = (io2 + fs).min(ib.len());
             for si in 0..n_samples {
                 let b = io2 + si * vl * es;
                 if b + 1 < ge {
-                    let a0 = (ib[b] >> 1).wrapping_sub(1);
-                    let a1 = (ib[b+1] >> 1).wrapping_sub(1);
-                    alleles[si * 2] = if a0 > 0 && a0 < 128 { 1 } else { 0 };
-                    alleles[si * 2 + 1] = if a1 > 0 && a1 < 128 { 1 } else { 0 };
+                    // Reserved bytes 0x80 (missing) and 0x81 (end-of-vector) are not alleles; a
+                    // haploid call (0x81 second slot) is the homozygote, as in the SRP builder.
+                    let b0 = ib[b];
+                    let b1 = if ib[b + 1] == 0x81 { b0 } else { ib[b + 1] };
+                    if b0 < 0x80 && b1 < 0x80 && (b0 >> 1) != 0 && (b1 >> 1) != 0
+                        && (b0 >> 1) != (b1 >> 1) && (b1 & 1) == 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData,
+                            "BCF panel is unphased (a '/' genotype separator was found); a reference panel must \
+contain phased haplotypes — phase it first (e.g. selphi --phase-panel) or supply the phased BCF"));
+                    }
+                    let alt = |x: u8| { let a = (x >> 1).wrapping_sub(1); x < 0x80 && a > 0 && a < 128 };
+                    alleles[si * 2] = alt(b0) as u8;
+                    alleles[si * 2 + 1] = alt(b1) as u8;
                 }
             }
+            gt_found = true;
             break;
         }
         io2 += fs;
     }
 
+    // A record without GT would enter the panel as every haplotype REF.
+    if !gt_found {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+            "the panel record at position {} carries no GT: a reference panel needs every haplotype's allele", pos)));
+    }
     let alt_count: usize = alleles.iter().filter(|&&a| a > 0).count();
     let ref_count = n_haps - alt_count;
     let (major_allele, minor_count) = if ref_count >= alt_count { (0u8, alt_count) } else { (1u8, ref_count) };
 
-    VariantRec { pos, id: id_str, ref_allele, alt_allele, alleles, major_allele, minor_count }
+    Ok(VariantRec { pos, id: id_str, ref_allele, alt_allele, alleles, major_allele, minor_count })
 }
 
 /// Write one BREF3 block.
@@ -698,5 +718,24 @@ mod tests {
         for (r, a) in [("AC", "A"), ("A", "AC"), ("N", "A"), ("a", "c"), ("", "A")] {
             assert_eq!(encode_snv_allele_code(r, a), None, "{r}>{a}");
         }
+    }
+
+    #[test]
+    fn bcf_gt_reserved_bytes_are_not_alt() {
+        // One A>G record, one FORMAT (GT, key 1), 4 samples.
+        let mut shared = vec![0u8; 24];
+        shared[18..20].copy_from_slice(&2u16.to_le_bytes());
+        shared[20..24].copy_from_slice(&((1u32 << 24) | 4).to_le_bytes());
+        shared.extend_from_slice(&[0x17, 0x2e, 0x17, 0x41, 0x17, 0x47]); // ".", "A", "G"
+        // 0|1, haploid REF (0x81 pad), missing (0x80), ./.
+        let indiv = vec![0x11, 1, 0x21, 0x02, 0x05, 0x02, 0x81, 0x80, 0x80, 0x00, 0x00];
+        let rec = parse_bcf_gt(&RawBcfRec { shared: shared.clone(), indiv }, 8, 4, 1).unwrap();
+        assert_eq!(rec.alleles, [0, 1, 0, 0, 0, 0, 0, 0]);
+        // An unphased heterozygote (0/1) is refused, as the SRP builder does.
+        let indiv = vec![0x11, 1, 0x21, 0x02, 0x04, 0x02, 0x03, 0x02, 0x03, 0x02, 0x03];
+        assert!(parse_bcf_gt(&RawBcfRec { shared: shared.clone(), indiv }, 8, 4, 1).is_err());
+        // A record whose only FORMAT field is not GT (key 2) is refused.
+        let indiv = vec![0x11, 2, 0x21, 0x02, 0x05, 0x02, 0x05, 0x02, 0x05, 0x02, 0x05];
+        assert!(parse_bcf_gt(&RawBcfRec { shared, indiv }, 8, 4, 1).is_err());
     }
 }

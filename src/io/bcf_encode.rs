@@ -163,7 +163,7 @@ fn begin_record(
     buf.extend_from_slice(&2u16.to_le_bytes());           // n_allele = 2
     // BCF2.2 packs n_fmt (top 8 bits) | n_sample (low 24 bits): n_samples must fit
     // in 24 bits (16,777,215) or it corrupts the n_fmt field. Intrinsic format limit.
-    debug_assert!(n_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", n_samples);
+    assert!(n_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", n_samples);
     let fmt_sample = (n_fmt as u32) << 24 | (n_samples as u32);
     buf.extend_from_slice(&fmt_sample.to_le_bytes());
 
@@ -477,7 +477,7 @@ pub fn encode_passthrough_record(
 ) {
     use crate::io::passthrough::{ABSENT, MISSING};
     let n_samples = samples.len();
-    debug_assert!(n_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", n_samples);
+    assert!(n_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", n_samples);
     let shared_start = buf.len();
     buf.extend_from_slice(&[0u8; 8]);
     buf.extend_from_slice(&rid.to_le_bytes());

@@ -1,4 +1,4 @@
-Script started on 2026-11-04 07:59:04+00:00 [COMMAND="selphi --refpanel chr22.srp --bam HG002.bam --reference GRCh38.fa --map chr22.map --out lowcov --threads 16 " <not executed on terminal>]
+Script started on 2026-11-04 07:59:04+00:00 [COMMAND="selphi --refpanel chr22.srp2 --bam HG002.bam --reference GRCh38.fa --map chr22.map --out lowcov --threads 16 " <not executed on terminal>]
 [1;36m[selphi][0m SIMD: [32mAVX-512F+DQ[0m
   auto-route: aligned reads (BAM/CRAM) [32m→ lcWGS engine[0m [2m[0.0s | 43 MB][0m
 [1;36m
@@ -10,7 +10,7 @@ Script started on 2026-11-04 07:59:04+00:00 [COMMAND="selphi --refpanel chr22.sr
 
   mode:     lcwgs
   input:    HG002.bam
-  refpanel: chr22.srp
+  refpanel: chr22.srp2
   map:      chr22.map
   output:   lowcov
   threads:  16

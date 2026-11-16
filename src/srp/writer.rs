@@ -1,4 +1,4 @@
-//! SRP writer: creates .srp files from VCF/BCF/BREF3 reference panels.
+//! SRP writer: creates .srp2 files from VCF/BCF/BREF3 reference panels.
 //!
 //! Pure Rust — no bcftools dependency. Uses noodles for VCF/BCF reading.
 //! Multi-allelic variants are kept (boolean: any ALT allele = 1).
@@ -6,7 +6,7 @@
 //! Pipeline:
 //!   Phase 1: Stream variants + genotypes, scatter to per-haplotype stripes
 //!   Phase 2: Batched parallel zstd tile compression
-//!   Phase 3: Stream tiles into the single-file .srp (StreamingTileWriter)
+//!   Phase 3: Stream tiles into the single-file .srp2 (StreamingTileWriter)
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -135,7 +135,7 @@ pub fn build_srp_from_bref3(
     selphi_info!("  chunks:   {} (chunk_size={})", n_chunks, chunk_size);
 
     let contig_field = format!("##contig=<ID={}>", chromosome);
-    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
+    let srp_path = super::helpers::with_panel_suffix(output_path, super::PANEL_EXT);
 
     // --- Pass 2: direct scatter + batched parallel compression ---
     // Read BREF3 sequentially, scatter to per-column stripe buffers.
@@ -276,7 +276,7 @@ impl SrpPanelWriter {
         }
         let contig_field = format!("##contig=<ID={}>", chromosome);
 
-        let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
+        let srp_path = super::helpers::with_panel_suffix(output_path, super::PANEL_EXT);
 
         selphi_info!("  samples:  {} ({} haplotypes)", n_samples, n_haps);
         selphi_info!("  variants: {} (chr{}, {}–{})", n_variants, chromosome, min_pos, max_pos);
@@ -322,7 +322,7 @@ impl SrpPanelWriter {
         Ok(())
     }
 
-    /// Flush the final stripe, finalize the file, and return the `.srp` path.
+    /// Flush the final stripe, finalize the file, and return the `.srp2` path.
     pub fn finish(mut self) -> Result<PathBuf, SrpWriterError> {
         if self.next_vi != self.n_variants {
             return Err(SrpWriterError::InvalidInput(format!(
@@ -343,7 +343,7 @@ impl SrpPanelWriter {
 /// the layout produced by the phasing engine. `variants` carries one entry
 /// per row in the same order. Thin materialized-slice wrapper over
 /// [`SrpPanelWriter`]: a freshly phased cohort held in memory is written as a
-/// live `.srp` without converting through BCF.
+/// live `.srp2` without converting through BCF.
 pub fn build_srp_from_panel(
     phased: &[u8],
     variants: &[PanelVariant],
@@ -370,7 +370,7 @@ pub fn build_srp_from_panel(
 
 
 /// Build unified SRP file from BCF source.
-/// Produces a SINGLE .srp file containing metadata, variants, chunks, and tiles.
+/// Produces a SINGLE .srp2 file containing metadata, variants, chunks, and tiles.
 /// Scatter one parsed chunk's set bits into the per-stripe tile-column map
 /// `active` (creating empty stripe entries on demand); `var_offset` is the
 /// chunk's global first-variant row. Verbatim inner loop shared by
@@ -525,7 +525,7 @@ pub fn build_srp_unified(
     let chunk_files: Vec<std::path::PathBuf> = region_results.iter()
         .flat_map(|rr| rr.chunk_files.iter().cloned()).collect();
 
-    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
+    let srp_path = super::helpers::with_panel_suffix(output_path, super::PANEL_EXT);
 
     // Streaming tile writer: process chunks one at a time from disk
     selphi_step!("Building tiles ({} threads)...", rayon::current_num_threads());
@@ -544,6 +544,7 @@ pub fn build_srp_unified(
     let mut active: std::collections::BTreeMap<usize, Vec<Vec<u16>>> = std::collections::BTreeMap::new();
     let mut var_offset = 0usize;
     let mut pending_stripes: Vec<(usize, Vec<Vec<u16>>)> = Vec::with_capacity(batch_size);
+    let mut next_stripe = 0usize;
     let mut stripes_flushed = 0usize;
 
     for (ci, cf) in chunk_files.iter().enumerate() {
@@ -564,13 +565,11 @@ pub fn build_srp_unified(
             last_stripe + 1 // flush everything
         };
 
-        let to_flush: Vec<usize> = active.keys().copied()
-            .take_while(|&s| s < next_first_stripe).collect();
-        for s in to_flush {
-            if let Some(cols) = active.remove(&s) {
-                pending_stripes.push((s, cols));
-            }
+        // Every stripe gets its tiles, one with no ALT allele too: the tile index has no gaps.
+        for s in next_stripe..next_first_stripe.min(n_stripes) {
+            pending_stripes.push((s, active.remove(&s).unwrap_or_else(|| vec![Vec::new(); n_haps])));
         }
+        next_stripe = next_stripe.max(next_first_stripe);
         if pending_stripes.len() >= batch_size {
             let flushed_now = pending_stripes.len();
             flush_stripe_batch(&mut tile_writer, &mut pending_stripes, n_haps)?;

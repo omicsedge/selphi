@@ -278,6 +278,7 @@ fn merge_passthrough_record(rec_bufs: &[Vec<u8>], total_samples: usize) -> std::
     let mut out = Vec::with_capacity(8 + v0.l_shared + v0.l_indiv * rec_bufs.len());
     out.extend_from_slice(&[0u8; 8]);
     out.extend_from_slice(&v0.shared[0..20]);
+    assert!(total_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", total_samples);
     out.extend_from_slice(&((1u32 << 24) | total_samples as u32).to_le_bytes());
     out.extend_from_slice(&v0.shared[24..]);
     let indiv_start = out.len();
@@ -364,6 +365,7 @@ fn merge_one_record(
     out.extend_from_slice(&v0.shared[0..16]);                       // chrom, pos, rlen, qual
     out.extend_from_slice(&new_n_info.to_le_bytes());                // updated n_info (offset 16..18)
     out.extend_from_slice(&v0.shared[18..20]);                       // n_allele (unchanged)
+    assert!(total_samples < (1 << 24), "BCF n_samples {} exceeds the 24-bit fmt_sample limit", total_samples);
     let fmt_sample_new = ((out_n_fmt + add_gp as u8) as u32) << 24 | (total_samples as u32);
     out.extend_from_slice(&fmt_sample_new.to_le_bytes());            // updated fmt_sample (offset 20..24)
 
