@@ -1076,7 +1076,7 @@ fn build_target_confidence(
 /// `main` free to continue to any post-pipeline work (currently none).
 pub fn run(args: &Args, target_path: &str, output_path: &str) {
     // Single-chr path: --map is required
-    let map_path = args.map_path.as_deref().expect("--map is required");
+    let map_path = crate::required(args.map_path.as_deref(), "--map is required");
 
     // Initialize global logger (writes to stderr + .log file)
     let log_path = selphi::common::utils::out_path(std::path::Path::new(output_path), "log");
@@ -1100,7 +1100,7 @@ pub fn run(args: &Args, target_path: &str, output_path: &str) {
 
     // 1. Load reference panel
     let srp = Arc::new(SrpReader::open(&args.refpanel, args.threads * 2)
-        .expect("Failed to load SRP reference panel"));
+        .unwrap_or_else(|e| crate::exit_on_io(&e, || selphi_error!("Failed to load SRP reference panel: {}", e))));
     let n_ref_variants = srp.n_variants();
     let n_ref = srp.n_haps();
     let ref_positions: &[i64] = srp.variants.positions();

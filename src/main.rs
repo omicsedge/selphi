@@ -99,6 +99,7 @@ fn main() {
         if args.merge_srps.is_some() { modes.push("--merge-srps"); }
         if args.merge_srps_dir.is_some() { modes.push("--merge-srps-dir"); }
         if args.prepare_reference_from.is_some() { modes.push("--prepare-reference-from"); }
+        if args.refpanel_dir.is_some() { modes.push("--refpanel-dir"); }
         if modes.len() > 1 {
             eprintln!("ERROR: the following are mutually exclusive top-level modes; pick one: {}.",
                 modes.join(", "));
@@ -388,7 +389,7 @@ fn main() {
             };
             match r.split_once(':') {
                 Some((c, range)) => {
-                    let (s, e) = range.split_once('-').unwrap_or((range, range));
+                    let (s, e) = range.split_once('-').unwrap_or((range, ""));
                     (c.to_string(), parse(s, 1), parse(e, i64::MAX))
                 }
                 None => (r.to_string(), 1, i64::MAX),
@@ -551,7 +552,7 @@ fn main() {
 
     // --- Evaluate accuracy mode ---
     if let Some(ref imputed) = args.evaluate {
-        let truth = args.truth.as_ref().expect("--truth required with --evaluate");
+        let truth = required(args.truth.as_deref(), "--truth required with --evaluate");
         let output = args.out.as_deref().unwrap_or("eval_results");
 
         let log_path = selphi::common::utils::out_path(std::path::Path::new(output), "log");
@@ -655,8 +656,8 @@ pass --homref-absent on to apply it (matched-sites scoring ignores it)");
 run per chromosome with a single-chr .srp, or drop --phase-only");
             std::process::exit(2);
         }
-        let input = args.input.as_ref().expect("--input required with --refpanel-dir");
-        let map_dir = args.map_dir.as_ref().expect("--map-dir required with --refpanel-dir");
+        let input = required(args.input.as_deref(), "--input required with --refpanel-dir");
+        let map_dir = required(args.map_dir.as_deref(), "--map-dir required with --refpanel-dir");
         let out = args.out.as_deref().unwrap_or("imputed");
 
         // std::env::temp_dir() honours TMPDIR (macOS → /var/folders/…) and falls
@@ -671,7 +672,7 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
             std::process::exit(1);
         });
 
-        let config = orchestrate::MultiChrImputeConfig::from_args(&args, Some(map_dir.clone()));
+        let config = orchestrate::MultiChrImputeConfig::from_args(&args, Some(map_dir.to_string()));
 
         let result = orchestrate::run_multi_chr(
             &temp_srp, input, Path::new(map_dir), out, &config,
@@ -702,8 +703,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
     if args.self_test {
         let config = self_test::SelfTestConfig {
             refpanel: &args.refpanel,
-            input: args.input.as_ref().expect("--input required for --self-test"),
-            map: args.map_path.as_ref().expect("--map required for --self-test"),
+            input: required(args.input.as_deref(), "--input required for --self-test"),
+            map: required(args.map_path.as_deref(), "--map required for --self-test"),
             out_base: args.out.as_deref().unwrap_or("self_test_output"),
             truth: args.truth.as_deref(),
             threads: args.threads,
@@ -938,8 +939,8 @@ run per chromosome with a single-chr .srp, or drop --phase-only");
         eprintln!("ERROR: --refpanel is required for imputation");
         std::process::exit(1);
     }
-    let target_path = args.input.as_deref().expect("--input is required");
-    let output_path = args.out.as_deref().expect("--out is required");
+    let target_path = required(args.input.as_deref(), "--input is required");
+    let output_path = required(args.out.as_deref(), "--out is required");
     selphi::common::utils::refuse_overwrite(&[target_path], &[
         selphi::common::utils::out_path(Path::new(output_path), if args.bcf { "bcf" } else { "vcf.gz" })]).unwrap_or_else(|f| exit_with(&f));
 
@@ -993,6 +994,11 @@ fn exit_with(f: &selphi::Fatal) -> ! {
 
 /// An `io::Error` out of a library call: the [`selphi::Fatal`] it carries ends the
 /// run as already reported; any other error is printed by `report`, then exit 1.
+/// A flag the chosen mode needs: missing is a usage error, not a panic.
+fn required<'a>(v: Option<&'a str>, msg: &str) -> &'a str {
+    v.unwrap_or_else(|| { eprintln!("ERROR: {msg}"); std::process::exit(1) })
+}
+
 fn exit_on_io(e: &std::io::Error, report: impl FnOnce()) -> ! {
     if let Some(f) = selphi::Fatal::of(e) { exit_with(f) }
     report();
