@@ -1539,8 +1539,11 @@ fn refalt_hash(r: &[u8], a: &[u8]) -> u64 {
     for &b in a { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
     h
 }
+/// The site whatever the padding of its alleles: a shared trailing suffix is dropped
+/// (`ATT>AT` is `AT>A`). Leading bases stay, as they fix the position the alleles start at.
 #[inline]
-pub(crate) fn site_key(c: &[u8], pos: i64, r: &[u8], a: &[u8]) -> (u64, i64, u64) {
+pub(crate) fn site_key(c: &[u8], pos: i64, mut r: &[u8], mut a: &[u8]) -> (u64, i64, u64) {
+    while r.len() > 1 && a.len() > 1 && r.last() == a.last() { r = &r[..r.len() - 1]; a = &a[..a.len() - 1]; }
     (contig_hash(norm_contig(c)), pos, refalt_hash(r, a))
 }
 
@@ -2597,6 +2600,31 @@ mod tests {
         assert_eq!(site.bin_n[8], 2);
         assert_eq!(diag.genotypes_rescued, 1); // explicit strong no-call is not a raw rescue
         assert_eq!(diag.scored_sites_absent_from_strong, 1);
+    }
+
+    #[test]
+    fn homref_matches_indel_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, rows: &[&str]| {
+            let path = dir.path().join(name);
+            let mut w = noodles_bgzf::io::Writer::new(std::fs::File::create(&path).unwrap());
+            writeln!(w, "##fileformat=VCFv4.2\n##contig=<ID=X,length=10000>\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n##FORMAT=<ID=DS,Number=1,Type=Float,Description=\"Dosage\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tA\tB").unwrap();
+            for r in rows { writeln!(w, "{r}").unwrap(); }
+            w.try_finish().unwrap();
+            path
+        };
+        // Two deletions, each padded differently in the truth.
+        let imp = write("imp.vcf.gz", &["X\t100\t.\tAT\tA\t.\tPASS\t.\tGT:DS\t1/1:2\t0/0:0",
+                                        "X\t200\t.\tGC\tG\t.\tPASS\t.\tGT:DS\t0/0:0\t1/1:2"]);
+        let truth = write("truth.vcf.gz", &["X\t100\t.\tATT\tAT\t.\tPASS\t.\tGT\t1/1\t0/0",
+                                            "X\t200\t.\tGCA\tGA\t.\tPASS\t.\tGT\t0/0\t1/1"]);
+        let names = vec!["A".to_string(), "B".to_string()];
+        let (acc, _, _, counts, _, diag) = evaluate_imputation(&imp, &truth, &names, None, &super::super::exclude::SiteExclusion::default()).unwrap();
+        assert_eq!(counts.n_matched, 2);
+        assert_eq!(diag.scored_sites_absent_from_strong, 0);
+        assert!(acc.compute_r2().iter().all(|&r| r == 1.0), "{:?}", acc.compute_r2());
+        // Leading bases are kept: these change different positions.
+        assert_ne!(site_key(b"X", 1, b"AC", b"AT"), site_key(b"X", 1, b"ACC", b"ACT"));
     }
 
     #[test]
