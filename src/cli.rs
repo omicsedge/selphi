@@ -137,7 +137,7 @@ pub struct Args {
     pub chunk_vars: usize,
 
     /// (--phase-panel) Restrict phasing to a genomic region "chr:start-end"
-    /// (or "chr"). Bounds memory for large WGS panels — phase region by
+    /// (or "chr", or "chr:start" to the chromosome's end, as samtools). Bounds memory for large WGS panels — phase region by
     /// region (SHAPEIT5-style), then ligate externally. Start/end are 1-based
     /// bp inclusive.
     #[arg(long)]
