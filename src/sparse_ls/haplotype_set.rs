@@ -494,11 +494,20 @@ impl TargetHaplotypeSet {
                     continue;
                 }
                 let base = ploidy_p1 * v;
+                // A haploid site holds two GLs (REF, ALT): its major/minor genotypes are 0/1, not 0/2.
+                let (i_maj, i_min) = if ploidy > 1 { (maj_gt, 2 - maj_gt) } else { (maj_gt / 2, 1 - maj_gt / 2) };
                 let gl1 = g.gl[base + 1];
-                let gl_maj = g.gl[base + maj_gt];
-                let gl_2_minus_maj = g.gl[base + (2 - maj_gt)];
+                let gl_maj = g.gl[base + i_maj];
+                let gl_2_minus_maj = g.gl[base + i_min];
                 // PHRED is "smaller is more likely" so <= picks minor.
                 if gl1 <= gl_maj || gl_2_minus_maj <= gl_maj {
+                    if ploidy == 1 {
+                        // Haploid: REF and ALT, each with its allele-frequency prior.
+                        let af = m.vars[v].calt as f32 / n_ref as f32;
+                        let p = [unphred[g.gl[base] as usize] as f32 * (1.0 - af), unphred[g.gl[base + 1] as usize] as f32 * af];
+                        if p[i_min] > p[i_maj] { self.sind_tar_gl[i].push(v as i32); }
+                        continue;
+                    }
                     // perform calling
                     let mut tmp = [0.0f32; 3];
                     tmp[0] = unphred[g.gl[base] as usize] as f32;
