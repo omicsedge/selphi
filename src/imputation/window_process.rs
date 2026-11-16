@@ -547,9 +547,10 @@ impl pbwt::AlleleRows for SubsetRows<'_> {
 fn expand_weights(w: super::hmm::CsrWeights, sites: &[usize], x: &[f64], n_var: usize)
     -> super::hmm::CsrWeights
 {
+    // A packed matrix would read as empty rows: fail loudly, in release builds too.
+    assert!(!w.is_packed(), "called sites are expanded before the weights are packed");
     let row = |r: usize| {
         let (a, b) = (w.indptr[r] as usize, w.indptr[r + 1] as usize);
-        debug_assert!(!w.is_packed(), "called sites are expanded before the weights are packed");
         (&w.indices[a..b], &w.data[a..b])
     };
     let mut indptr = Vec::with_capacity(n_var + 1);

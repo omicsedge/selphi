@@ -314,7 +314,8 @@ impl CsrWeights {
     /// Unchanged when every row is kept.
     pub fn keep_rows(self, keep: &[bool]) -> CsrWeights {
         if keep.iter().take(self.n_rows).all(|&k| k) { return self; }
-        debug_assert!(!self.is_packed(), "rows are kept before the weights are packed");
+        // A packed matrix would read as empty rows: fail loudly, in release builds too.
+        assert!(!self.is_packed(), "rows are kept before the weights are packed");
         // Sized exactly, as the CSR it replaces was: every haplotype's weights are held until
         // the window is written, so grown (up to twice too large) buffers would cost memory.
         let kept = |r: usize| keep.get(r).copied().unwrap_or(true);
