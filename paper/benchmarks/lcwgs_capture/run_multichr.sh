@@ -33,7 +33,7 @@ fi
 NS=$(bcftools query -l $D/panel_noleak.bcf | wc -l); say "panel: $NS samples"
 
 # ---------- 2. SRP for Selphi + chr-prefixed panel for GLIMPSE2 ----------
-[ -s $D/s2.srp ] || { say "SRP"; $S2 --prepare-reference-from $D/panel_noleak.bcf --out $D/s2 --threads 16 > $D/srp.log 2>&1; }
+[ -s $D/s2.srp ] || { say "SRP"; $S2 --prepare-reference-from $D/panel_noleak.bcf --out $D/s2.srp --threads 16 > $D/srp.log 2>&1; }
 if [ ! -s $D/panel_g2.bcf ]; then
   say "panel chr-prefixed"; echo "$N chr$N" > $D/rename_to_chr.txt
   bcftools annotate --rename-chrs $D/rename_to_chr.txt $D/panel_noleak.bcf -Ob -o $D/panel_g2.bcf && bcftools index -f $D/panel_g2.bcf

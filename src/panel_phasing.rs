@@ -33,7 +33,7 @@ struct Cohort {
 /// phase (if any) is irrelevant — graph construction uses genotypes only, so
 /// an already-phased panel (SRP/BREF3, or phased VCF) is simply re-phased.
 fn read_cohort(input_path: &str) -> Cohort {
-    if input_path.ends_with(".srp") {
+    if selphi::srp::is_panel_path(input_path) {
         cohort_from_srp(input_path)
     } else if input_path.ends_with(".bref3") {
         cohort_from_bref3(input_path)
@@ -437,8 +437,8 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
     let out = PathBuf::from(output_path);
     let base = reference_base(&out);
     let mut outputs = vec![selphi::common::utils::out_path(&out, "vcf.gz")];
-    if args.srp { outputs.push(append_ext(&base, "srp")); }
-    if args.bref3 { outputs.push(append_ext(&base, "bref3")); }
+    if args.srp { outputs.push(selphi::srp::helpers::with_panel_suffix(&base, selphi::srp::PANEL_EXT)); }
+    if args.bref3 { outputs.push(selphi::srp::helpers::with_panel_suffix(&base, "bref3")); }
     selphi::common::utils::refuse_overwrite(&[input_path], &outputs).unwrap_or_else(|f| crate::exit_with(&f));
 
     let log_path = selphi::common::utils::out_path(Path::new(output_path), "log");
@@ -604,25 +604,13 @@ pub fn run(args: &Args, input_path: &str, output_path: &str) {
 /// (the format the imputation reader consumes) with no BCF/VCF round-trip;
 /// BREF3 reuses the byte-identical SRP→BREF3 converter. Both derive from the
 /// in-memory `phased` array, so this is cheap relative to phasing itself.
-/// Append `.ext` to a base that may legitimately contain dots (e.g. a
-/// chromosome tag like `panel.chr22`). `Path::with_extension` would REPLACE the
-/// last dotted component (`panel.chr22` → `panel.srp`), silently dropping the
-/// chromosome tag and colliding across chromosomes; appending keeps it
-/// (`panel.chr22` → `panel.chr22.srp`), matching the emitted `.vcf.gz`.
 /// Clean base name of the reference outputs: a trailing .vcf.gz / .gz / .vcf
-/// stripped, so they are `<base>.srp` / `<base>.bref3`, not `<base>.vcf.srp`.
+/// stripped, so they are `<base>.srp2` / `<base>.bref3`, not `<base>.vcf.srp2`.
 fn reference_base(out_path: &Path) -> PathBuf {
     let mut base = out_path.to_path_buf();
     if base.extension().is_some_and(|e| e == "gz") { base.set_extension(""); }
     if base.extension().is_some_and(|e| e == "vcf") { base.set_extension(""); }
     base
-}
-
-fn append_ext(base: &Path, ext: &str) -> PathBuf {
-    let mut s = base.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
 }
 
 fn write_reference_panels(
@@ -641,7 +629,7 @@ fn write_reference_panels(
     // SRP is needed for either output; write it to its final location when
     // --srp was requested, otherwise to a tempdir on the same filesystem
     // (kept off /tmp) that is removed once BREF3 is built.
-    let srp_out = append_ext(&base, "srp");
+    let srp_out = selphi::srp::helpers::with_panel_suffix(&base, selphi::srp::PANEL_EXT);
     let mut _tmp_keep: Option<tempfile::TempDir> = None;
     let srp_path: PathBuf = if args.srp {
         srp_out.clone()
@@ -650,7 +638,7 @@ fn write_reference_panels(
             .map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let td = tempfile::Builder::new().prefix(".selphi_panel_srp_").tempdir_in(&parent)
             .unwrap_or_else(|e| { selphi_error!("Cannot create temp dir for SRP: {}", e); std::process::exit(1); });
-        let p = td.path().join("panel.srp");
+        let p = td.path().join(format!("panel.{}", selphi::srp::PANEL_EXT));
         _tmp_keep = Some(td);
         p
     };
@@ -662,7 +650,7 @@ fn write_reference_panels(
     }
 
     if args.bref3 {
-        let bref3_out = append_ext(&base, "bref3");
+        let bref3_out = selphi::srp::helpers::with_panel_suffix(&base, "bref3");
         write_bref3_from_srp(&srp_path, &bref3_out)
             .unwrap_or_else(|e| { selphi_error!("Failed to write phased panel BREF3: {}", e); std::process::exit(1); });
         selphi_step!("Phased panel BREF3: {}", bref3_out.display());
@@ -819,7 +807,7 @@ fn run_streaming(args: &Args, input_path: &str, output_path: &str, map_path: &st
     // memory bounded to one stripe batch (the whole point of the streaming path).
     let mut srp_writer = if args.srp || args.bref3 {
         let base = reference_base(&out_path);
-        let srp_path = append_ext(&base, "srp");
+        let srp_path = selphi::srp::helpers::with_panel_suffix(&base, selphi::srp::PANEL_EXT);
         let pvs: Vec<PanelVariant> = markers.iter().map(|m| PanelVariant {
             chrom: &m.chrom, pos: m.pos, ref_allele: &m.ref_allele,
             alt_allele: &m.alt_allele, id: &m.id,

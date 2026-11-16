@@ -1,4 +1,4 @@
-//! SRP reader: opens .srp reference panel files.
+//! SRP reader: opens .srp2 reference panel files.
 
 use std::fs::File;
 use std::io::Read as _;

@@ -49,7 +49,7 @@ say "F4: filtered panel (alleles <=255bp) + prep SRP selphi2"
 if [ ! -f s2_chr22.srp ]; then
   bcftools view -e 'STRLEN(REF)>255 || STRLEN(ALT)>255' "$BCF22" -Ob -o panel22_filt.bcf
   bcftools index -f panel22_filt.bcf
-  "$S2BIN" --prepare-reference-from panel22_filt.bcf --out s2_chr22 --threads 16 > selphi2_prep.log 2>&1 \
+  "$S2BIN" --prepare-reference-from panel22_filt.bcf --out s2_chr22.srp --threads 16 > selphi2_prep.log 2>&1 \
     || { say "F4 prep FAILED"; tail -5 selphi2_prep.log; }
 fi
 

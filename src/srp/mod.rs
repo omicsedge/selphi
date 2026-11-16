@@ -1,7 +1,7 @@
 //! SRP (Sparse Reference Panel) reader and writer.
 //!
-//! The `.srp` format is a binary, tile-based sparse panel (the legacy
-//! zstd-ZIP/`.npz` archive layout is gone). Two variants, distinguished by an
+//! The `.srp2` format is a binary, tile-based sparse panel (Selphi 1's zstd-ZIP
+//! `.srp` archive is a different format, refused on open). Two variants, distinguished by an
 //! 8-byte magic:
 //!   - Single-chr (`SRP_SINGLE_CHR_MAGIC`, `b"SRP\0\x02.."`, v2): header +
 //!     variant index + sample IDs + 2D sparse tiles.
@@ -46,6 +46,13 @@ pub const SRP_SINGLE_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x02\x00\x00\x00";
 
 /// Magic bytes for multi-chromosome SRP format.
 pub const SRP_MULTI_CHR_MAGIC: &[u8; 8] = b"SRP\x00\x03\x00\x00\x00";
+
+/// A panel file's extension. Panels written as `.srp` before it still open: the magic,
+/// not the name, decides the format.
+pub const PANEL_EXT: &str = "srp2";
+
+/// Whether `path` names a panel: `.srp2`, or `.srp` from earlier builds.
+pub fn is_panel_path(path: &str) -> bool { path.ends_with(".srp2") || path.ends_with(".srp") }
 
 /// Sibling magics of a panel whose variant index (any chromosome's, for a multi-chr
 /// file) holds a field of 255 B or longer, i.e. is written behind

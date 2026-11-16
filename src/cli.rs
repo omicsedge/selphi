@@ -33,7 +33,7 @@ pub enum GqScope { Snp, All }
 #[derive(Parser, Debug)]
 #[command(name = "selphi", about = "PBWT-based genotype imputation")]
 pub struct Args {
-    /// Path to reference panel (.srp). Optional for --prepare-reference.
+    /// Path to reference panel (.srp2). Optional for --prepare-reference.
     #[arg(long, default_value = "")]
     pub refpanel: String,
 
@@ -246,7 +246,7 @@ pub struct Args {
     /// reimplements the GLIMPSE2 model: ref_haplotype_set + sparse PBWT selection +
     /// GL-aware Li-Stephens FB + diplotype-mosaic rephasing + MT19937). Separate from
     /// the default --lcwgs engine; produces GT:DS:GP via the same writer.
-    /// Requires --input (PL VCF/BCF), --refpanel (.srp), and --map. Seed via --seed.
+    /// Requires --input (PL VCF/BCF), --refpanel (.srp2), and --map. Seed via --seed.
     #[arg(long)]
     pub ls_exact: bool,
 
@@ -308,7 +308,7 @@ pub struct Args {
     #[arg(long, alias = "prepare_reference_from", alias = "prepare-reference-from")]
     pub prepare_reference_from: Option<String>,
 
-    /// Directory with per-chr reference panels (chr{N}.srp or chr{N}_v2.srp).
+    /// Directory with per-chr reference panels (chr{N}.srp2; .srp from earlier builds too).
     /// Enables multi-chromosome mode: auto-discovers panels, splits input by
     /// contig, imputes each, and concatenates into a single output.
     #[arg(long)]
@@ -509,7 +509,7 @@ pub struct Args {
     #[arg(long)]
     pub selfdecode: bool,
 
-    /// (--phase-panel) Also emit the phased panel as an .srp reference panel,
+    /// (--phase-panel) Also emit the phased panel as an .srp2 reference panel,
     /// ready to use directly with --refpanel (no VCF→SRP round-trip).
     #[arg(long)]
     pub srp: bool,
@@ -568,7 +568,7 @@ pub struct Args {
     pub exclude_sites: Option<String>,
 
     /// (--evaluate / --truth) Also exclude every site monomorphic in this reference
-    /// panel (.srp): an allele the panel does not carry cannot be imputed by any tool.
+    /// panel (.srp2): an allele the panel does not carry cannot be imputed by any tool.
     /// Pass the panel the imputation used. Optional.
     #[arg(long, value_name = "SRP")]
     pub exclude_panel_monomorphic: Option<String>,
@@ -598,12 +598,12 @@ pub struct Args {
     pub self_test: bool,
 
     /// Merge per-chromosome SRP files into a single multi-chr SRP.
-    /// Provide comma-separated paths: --merge-srps chr1.srp,chr2.srp,chr3.srp
+    /// Provide comma-separated paths: --merge-srps chr1.srp2,chr2.srp2,chr3.srp2
     #[arg(long)]
     pub merge_srps: Option<String>,
 
     /// Merge all SRP files from a directory into a single multi-chr SRP.
-    /// Auto-discovers chr{N}.srp files, validates sample consistency.
+    /// Auto-discovers chr{N}.srp2 files, validates sample consistency.
     #[arg(long)]
     pub merge_srps_dir: Option<String>,
 

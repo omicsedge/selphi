@@ -3,7 +3,7 @@
 //! Lifted out of the single-chr pipeline so the multi-chromosome orchestrator
 //! can run the same evaluation: `--truth` used to be read only by
 //! `imputation_pipeline::run`, so a whole-genome run (`--refpanel-dir`, or a
-//! multi-chr `.srp`) accepted the flag, imputed, and exited without a word about
+//! multi-chr `.srp2`) accepted the flag, imputed, and exited without a word about
 //! it. Nothing failed and no warning was printed, which is the worst way for a
 //! benchmark to be wrong.
 //!

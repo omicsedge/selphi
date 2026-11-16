@@ -1,6 +1,6 @@
 //! Multi-chromosome SRP writer.
 //!
-//! Creates a single .srp file containing all chromosomes from a multi-contig
+//! Creates a single .srp2 file containing all chromosomes from a multi-contig
 //! BCF/VCF source. Each chromosome gets its own tile section with independent
 //! tile indices, while sample IDs are shared globally.
 
@@ -60,7 +60,7 @@ pub fn build_multi_chr_srp(
         contig_order.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", "));
 
     // Create output file
-    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
+    let srp_path = super::helpers::with_panel_suffix(output_path, super::PANEL_EXT);
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
@@ -483,7 +483,7 @@ pub fn merge_samples_single_chr(
         n_tile_rows, n_tile_cols, n_tiles);
 
     // Write single-chr SRP
-    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
+    let srp_path = super::helpers::with_panel_suffix(output_path, super::PANEL_EXT);
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
@@ -711,7 +711,7 @@ pub fn build_multi_chr_srp_from_dir(
 
     for (i, (chr, bcf_path)) in bcf_files.iter().enumerate() {
         selphi_step!("[{}/{}] Building SRP for chr{}...", i + 1, bcf_files.len(), chr);
-        let tmp_srp = tmp_dir.path().join(format!("chr{}.srp", chr));
+        let tmp_srp = tmp_dir.path().join(format!("chr{}.{}", chr, super::PANEL_EXT));
         super::writer::build_srp_any(bcf_path, &tmp_srp, threads, chunk_size_override)
             .map_err(|e| match e {
                 // Already reported: passed on as it is, for the caller's exit status.
@@ -842,7 +842,7 @@ pub fn merge_single_chr_srps(
     }
 
     // Create output file
-    let srp_path = super::helpers::with_panel_suffix(output_path, "srp");
+    let srp_path = super::helpers::with_panel_suffix(output_path, super::PANEL_EXT);
     let out = std::fs::File::create(&srp_path)?;
     let mut w = std::io::BufWriter::with_capacity(4 << 20, out);
 
@@ -983,18 +983,18 @@ pub fn merge_single_chr_srps(
 }
 
 /// Merge all SRP files from a directory into a single multi-chr SRP.
-/// Auto-discovers .srp files, validates each can be opened, checks for duplicate
+/// Auto-discovers panel files (.srp2, or .srp from earlier builds), validates each can be opened, checks for duplicate
 /// chromosomes, and merges into a single output.
 pub fn merge_srps_from_dir(
     source_dir: &Path,
     output_path: &Path,
 ) -> io::Result<()> {
-    // Scan directory for .srp files
+    // Scan directory for panel files
     let mut srp_files: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(source_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".srp") {
+            if super::is_panel_path(&name) {
                 srp_files.push(entry.path());
             }
         }
@@ -1002,7 +1002,7 @@ pub fn merge_srps_from_dir(
 
     if srp_files.is_empty() {
         return Err(io::Error::new(io::ErrorKind::NotFound,
-            format!("No .srp files found in {}", source_dir.display())));
+            format!("No .srp2 files found in {}", source_dir.display())));
     }
 
     srp_files.sort();

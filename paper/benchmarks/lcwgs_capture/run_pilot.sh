@@ -127,7 +127,7 @@ if ! stage_done s6b; then
   say "S6b: Selphi 2 imputation chr22"
   if [ ! -f s2_chr22.srp ]; then
     say "S6b: prepare reference .srp for Selphi 2 from BCF"
-    "$S2BIN" --prepare-reference-from "$BCF22" --out s2_chr22 --threads 16 > selphi2_prep.log 2>&1 || \
+    "$S2BIN" --prepare-reference-from "$BCF22" --out s2_chr22.srp --threads 16 > selphi2_prep.log 2>&1 || \
       { say "S6b prep FAILED:"; tail -5 selphi2_prep.log; }
   fi
   if [ -f s2_chr22.srp ]; then

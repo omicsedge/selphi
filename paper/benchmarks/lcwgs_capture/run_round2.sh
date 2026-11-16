@@ -28,7 +28,7 @@ say "R1: AF calculated for $(wc -l < af22.tsv) sites"
 
 say "R2: prepare leak-free SRP for Selphi 2"
 if [ ! -f s2_chr22_noleak.srp ]; then
-  "$S2BIN" --prepare-reference-from panel22_noleak.bcf --out s2_chr22_noleak --threads 16 > selphi2_prep_nl.log 2>&1 \
+  "$S2BIN" --prepare-reference-from panel22_noleak.bcf --out s2_chr22_noleak.srp --threads 16 > selphi2_prep_nl.log 2>&1 \
     || { say "R2 FAILED"; tail -5 selphi2_prep_nl.log; }
 fi
 
